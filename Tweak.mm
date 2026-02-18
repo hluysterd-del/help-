@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// EverLight — Single File Tweak  (FIXED — error-free build)
+// EverLight — Single File Tweak  (SIDELOAD + DYLIB FULLY CRASH-FIXED v3)
 // Built from scratch — no skid ✓
 // Galaxy theme — deep space, nebula purples, star glows
 // Spawns items by writing animal-company-config.json directly
@@ -11,12 +11,43 @@
 //   3. Fixed signed/unsigned NSInteger vs NSUInteger loop comparisons.
 //   4. Replaced deprecated -keyWindow with a scene-safe helper (iOS 13+).
 //   5. Replaced private KVC _placeholderLabel.textColor with attributed placeholder.
+//   6. Added Unity IL2CPP camera position grabber — items now spawn at camera world coords.
+//   7. Changed state: 0 → state: 1 so the game treats entries as pending (not already handled).
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>  // FIX 2 — CAGradientLayer, CABasicAnimation
 #import <objc/runtime.h>
-#import <substrate.h>
+#import <dlfcn.h>
+#import <unistd.h>
+
+// ── Runtime hooking-engine shim (no hard substrate dependency) ────────────────
+typedef void (*_ELHookFn_t)(void *, void *, void **);
+static _ELHookFn_t _ELHookFn = NULL;
+static void ELInitHookEngine(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *libs[] = {
+            "/usr/lib/libsubstrate.dylib",
+            "/usr/lib/libsubstitute.dylib",
+            "/usr/lib/libhooker.dylib",
+            "/Library/Frameworks/CydiaSubstrate.framework/CydiaSubstrate",
+            NULL
+        };
+        for (int i = 0; libs[i]; i++) {
+            void *h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
+            if (!h) continue;
+            _ELHookFn = (_ELHookFn_t)dlsym(h, "MSHookFunction");
+            if (_ELHookFn) break;
+        }
+    });
+}
+static void ELHookFunction(void *sym, void *rep, void **orig) {
+    if (!sym) { if (orig) *orig = NULL; return; }
+    ELInitHookEngine();
+    if (_ELHookFn) _ELHookFn(sym, rep, orig);
+    else if (orig) *orig = sym;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // FIX 1 — Block-based UIGestureRecognizer support
@@ -43,22 +74,24 @@
 static NSMutableArray *_ELGestureTargets;
 
 @interface UIGestureRecognizer (ELBlocks)
-/// Adds a block-based action handler. Mirrors the original code's calling convention.
-- (void)addTarget:(void (^)(id sender))block withObject:(id)unused;
+- (void)el_addBlock:(void (^)(id))block;
 @end
 
+// Global token so the array is initialised exactly once even across reloads
+static dispatch_once_t _ELGestureOnce;
+
 @implementation UIGestureRecognizer (ELBlocks)
-- (void)addTarget:(void (^)(id))block withObject:(__unused id)unused {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ _ELGestureTargets = [NSMutableArray array]; });
+- (void)el_addBlock:(void (^)(id))block {
+    dispatch_once(&_ELGestureOnce, ^{ _ELGestureTargets = [NSMutableArray array]; });
     _ELBlockTarget *t = [_ELBlockTarget targetWithBlock:block];
-    [_ELGestureTargets addObject:t];          // retain
+    [_ELGestureTargets addObject:t];
     [self addTarget:t action:@selector(fire:)];
 }
 @end
 
 // ─── FIX 4 — Safe key window helper (iOS 13+) ────────────────────────────────
 static UIWindow *ELKeyWindow(void) {
+    if (![UIApplication sharedApplication]) return nil;
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive &&
@@ -72,6 +105,151 @@ static UIWindow *ELKeyWindow(void) {
         }
     }
     return [UIApplication sharedApplication].keyWindow;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Unity IL2CPP — Camera world-position grabber
+// We resolve Camera.main and call get_transform / get_position via il2cpp_resolve_icall.
+// Falls back to {0,0,0} if Unity isn't ready yet.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+typedef struct { float x, y, z; }    ELVec3;
+typedef struct { float x, y, z, w; } ELQuat;
+
+// IL2CPP type stubs (opaque pointers)
+typedef void* Il2CppObject;
+typedef void* Il2CppClass;
+typedef void* Il2CppDomain;
+typedef void* Il2CppAssembly;
+typedef void* Il2CppImage;
+
+// il2cpp runtime exports
+extern Il2CppDomain* il2cpp_domain_get(void)                                           __attribute__((weak_import));
+extern void*         il2cpp_resolve_icall(const char *name)                             __attribute__((weak_import));
+extern void*         il2cpp_domain_assembly_open(void *domain, const char *name)        __attribute__((weak_import));
+extern void*         il2cpp_assembly_get_image(void *assembly)                          __attribute__((weak_import));
+extern void*         il2cpp_class_from_name(void *image, const char *ns, const char *n) __attribute__((weak_import));
+extern void*         il2cpp_class_get_method_from_name(void *klass, const char *name, int argc) __attribute__((weak_import));
+extern void*         il2cpp_method_get_pointer(void *method)                            __attribute__((weak_import));
+
+// Cached function pointers resolved once on first spawn
+static Il2CppObject* (*_Camera_get_main)(void)                  = NULL;
+static Il2CppObject* (*_Component_get_transform)(Il2CppObject*) = NULL;
+static ELVec3        (*_Transform_get_position)(Il2CppObject*)  = NULL;
+static BOOL          _positionIsInjected                         = NO;  // cached — no re-resolve at spawn
+
+static void ELResolveUnityFuncs(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!il2cpp_resolve_icall) return;
+        _Camera_get_main         = il2cpp_resolve_icall("UnityEngine.Camera::get_main");
+        _Component_get_transform = il2cpp_resolve_icall("UnityEngine.Component::get_transform");
+        void *injected           = il2cpp_resolve_icall("UnityEngine.Transform::get_position_Injected");
+        if (injected) {
+            _Transform_get_position = injected;
+            _positionIsInjected     = YES;
+        } else {
+            _Transform_get_position = il2cpp_resolve_icall("UnityEngine.Transform::get_position");
+            _positionIsInjected     = NO;
+        }
+    });
+}
+
+/// Returns the main camera's world-space position, or {0,0,0} on failure.
+static ELVec3 ELCameraPosition(void) {
+    ELVec3 zero = {0, 0, 0};
+    ELResolveUnityFuncs();
+    if (!_Camera_get_main || !_Component_get_transform || !_Transform_get_position)
+        return zero;
+
+    Il2CppObject *cam = _Camera_get_main();
+    if (!cam) return zero;
+
+    Il2CppObject *transform = _Component_get_transform(cam);
+    if (!transform) return zero;
+
+    ELVec3 pos = {0, 0, 0};
+    typedef void   (*GetPosInjected)(Il2CppObject*, ELVec3*);
+    typedef ELVec3 (*GetPosDirect)(Il2CppObject*);
+
+    if (_positionIsInjected)
+        ((GetPosInjected)_Transform_get_position)(transform, &pos);
+    else
+        pos = ((GetPosDirect)_Transform_get_position)(transform);
+    return pos;
+}
+
+/// Returns the main camera's world-space rotation as a quaternion, or identity on failure.
+static ELQuat ELCameraRotation(void) {
+    ELQuat identity = {0, 0, 0, 1};
+    ELResolveUnityFuncs();
+    if (!_Camera_get_main || !_Component_get_transform) return identity;
+
+    Il2CppObject *cam = _Camera_get_main();
+    if (!cam) return identity;
+    Il2CppObject *transform = _Component_get_transform(cam);
+    if (!transform) return identity;
+
+    // Try injected variant first, then direct
+    typedef void   (*GetRotInjected)(Il2CppObject*, ELQuat*);
+    typedef ELQuat (*GetRotDirect)(Il2CppObject*);
+
+    static void *_getRotFn    = NULL;
+    static BOOL  _rotInjected = NO;
+    static dispatch_once_t rotOnce;
+    dispatch_once(&rotOnce, ^{
+        _getRotFn = il2cpp_resolve_icall ? il2cpp_resolve_icall("UnityEngine.Transform::get_rotation_Injected") : NULL;
+        if (_getRotFn) { _rotInjected = YES; return; }
+        _getRotFn = il2cpp_resolve_icall ? il2cpp_resolve_icall("UnityEngine.Transform::get_rotation") : NULL;
+        _rotInjected = NO;
+    });
+
+    if (!_getRotFn) return identity;
+    ELQuat rot = {0, 0, 0, 1};
+    if (_rotInjected) ((GetRotInjected)_getRotFn)(transform, &rot);
+    else              rot = ((GetRotDirect)_getRotFn)(transform);
+    return rot;
+}
+
+/// Writes a fling-forward teleport: current camera pos + (flingDist metres in camera forward direction).
+static BOOL ELFlingForward(CGFloat flingDist) {
+    ELVec3 pos  = ELCameraPosition();
+    ELQuat rot  = ELCameraRotation();
+
+    // Derive forward vector from quaternion: Unity's forward is (0,0,1) rotated by q
+    float x = rot.x, y = rot.y, z = rot.z, w = rot.w;
+    float fwdX = 2*(x*z + w*y);
+    float fwdY = 2*(y*z - w*x);
+    float fwdZ = 1 - 2*(x*x + y*y);
+
+    // Normalize (should already be unit but be safe)
+    float len = sqrtf(fwdX*fwdX + fwdY*fwdY + fwdZ*fwdZ);
+    if (len > 0.001f) { fwdX /= len; fwdY /= len; fwdZ /= len; }
+
+    // Target position: fling forward, keep Y flat (no vertical fling)
+    float targetX = pos.x + fwdX * flingDist;
+    float targetY = pos.y;                      // stay at same height
+    float targetZ = pos.z + fwdZ * flingDist;
+
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    NSDictionary *tpos = @{ @"x": @(targetX), @"y": @(targetY), @"z": @(targetZ) };
+    config[@"playerPosition"]  = tpos;
+    config[@"teleportPosition"] = tpos;
+    config[@"warpPosition"]    = tpos;
+    config[@"spawnPosition"]   = tpos;
+    config[@"flingForward"]    = @YES;
+    config[@"flingDistance"]   = @(flingDist);
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
 }
 
 // ─── Config path ──────────────────────────────────────────────────────────────
@@ -144,63 +322,200 @@ static void ELAddStars(UIView *view, NSInteger count) {
 // ─── Items ────────────────────────────────────────────────────────────────────
 static NSArray<NSString *> *ELAllItems(void) {
     return @[
-        @"item_alphablade",           @"item_arena_pistol",          @"item_arena_shotgun",
-        @"item_axe",                  @"item_bat",                   @"item_bow",
-        @"item_crossbow",             @"item_dagger",                @"item_dynamite",
-        @"item_grenade",              @"item_anti_gravity_grenade",  @"item_hammer",
-        @"item_jetpack",              @"item_machete",               @"item_pickaxe",
-        @"item_pistol",               @"item_rpg",                   @"item_rpg_ammo",
-        @"item_shotgun",              @"item_shovel",                @"item_smg",
-        @"item_sniper",               @"item_staff",                 @"item_stash_grenade",
-        @"item_sword",                @"item_wand",                  @"item_torch",
-        @"item_flashlight",           @"item_lantern",
-        @"item_goldbar",              @"item_cash_mega_pile",        @"item_coin",
-        @"item_gem_blue",             @"item_gem_green",             @"item_gem_red",
-        @"item_ruby",                 @"item_crown",                 @"item_trophy",
-        @"item_key",                  @"item_diamond",
-        @"item_backpack_large_base",  @"item_quiver",                @"item_shield",
-        @"item_vest",                 @"item_medkit",                @"item_potion_health",
-        @"item_potion_speed",         @"item_collar",                @"item_football",
-        @"item_fishing_rod",          @"item_fishing_rod_pro",
-        @"item_bait_firefly",         @"item_bait_glowworm",         @"item_bait_minnow",
-        @"item_fish_bass",            @"item_fish_catfish",          @"item_fish_crab",
-        @"item_fish_eel",             @"item_fish_goldfish",         @"item_fish_piranha",
-        @"item_fish_salmon",          @"item_fish_shark",            @"item_fish_trout",
-        @"item_apple",                @"item_banana",                @"item_bread",
-        @"item_carrot",               @"item_cheese",                @"item_mushroom",
-        @"item_egg",                  @"item_water",                 @"item_bone",
-        @"item_turkey_whole",         @"item_turkey_leg",            @"item_heartchocolatebox",
-        @"item_stinky_cheese",        @"item_company_ration",        @"item_cracker",
-        @"item_radioactive_broccoli", @"item_campfire",
+        // Weapons
+        @"item_arena_pistol",         @"item_arena_shotgun",
+        @"item_revolver",             @"item_revolver_gold",
+        @"item_shotgun",              @"item_crossbow",
+        @"item_crossbow_heart",       @"item_flaregun",
+        @"item_heart_gun",            @"item_teleport_gun",
+        @"item_grenade_launcher",     @"item_rpg",
+        @"item_rpg_cny",              @"item_rpg_easter",
+        @"item_rpg_spear",            @"item_friend_launcher",
+        @"item_hookshot",             @"item_hookshot_sword",
+        @"item_lance",                @"item_viking_hammer",
+        @"item_viking_hammer_twilight",@"item_baseball_bat",
+        @"item_crowbar",              @"item_frying_pan",
+        @"item_pickaxe",              @"item_pickaxe_cny",
+        @"item_pickaxe_cube",         @"item_pinata_bat",
+        @"item_pipe",                 @"item_police_baton",
+        @"item_drill",                @"item_shredder",
+        @"item_scissors",             @"item_plunger",
+        @"item_treestick",            @"item_stick_bone",
+        @"item_stick_armbones",
+        // Grenades / Explosives
+        @"item_grenade",              @"item_grenade_gold",
+        @"item_anti_gravity_grenade", @"item_impulse_grenade",
+        @"item_cluster_grenade",      @"item_stash_grenade",
+        @"item_tele_grenade",         @"item_flashbang",
+        @"item_dynamite",             @"item_dynamite_cube",
+        @"item_sticky_dynamite",      @"item_landmine",
+        @"item_timebomb",             @"item_tripwire_explosive",
+        @"item_broccoli_grenade",     @"item_broccoli_shrink_grenade",
+        @"item_arrow_bomb",           @"item_arrow_teleport",
+        @"item_arrow_lightbulb",
+        // Ammo
+        @"item_arrow",                @"item_arrow_heart",
+        @"item_revolver_ammo",        @"item_shotgun_ammo",
+        @"item_rpg_ammo",             @"item_rpg_ammo_egg",
+        @"item_rpg_ammo_spear",       @"item_quiver",
+        @"item_quiver_heart",
+        // Tools / Utility
+        @"item_flashlight",           @"item_flashlight_mega",
+        @"item_flashlight_red",       @"item_jetpack",
+        @"item_hoverpad",             @"item_pogostick",
+        @"item_zipline_gun",          @"item_hookshot",
+        @"item_portable_teleporter",  @"item_rope",
+        @"item_scanner",              @"item_disposable_camera",
+        @"item_server_pad",           @"item_keycard",
+        @"item_hh_key",               @"item_saddle",
+        @"item_shield",               @"item_shield_bones",
+        @"item_shield_police",        @"item_shield_viking_1",
+        @"item_shield_viking_2",      @"item_shield_viking_3",
+        @"item_shield_viking_4",
+        // Bags / Carrying
+        @"item_backpack",             @"item_backpack_black",
+        @"item_backpack_green",       @"item_backpack_pink",
+        @"item_backpack_white",       @"item_backpack_large_base",
+        @"item_backpack_large_basketball",@"item_backpack_large_clover",
+        @"item_backpack_small_base",  @"item_backpack_with_flashlight",
+        @"item_pelican_case",         @"item_crate",
+        @"item_cardboard_box",
+        // Valuables / Loot
+        @"item_goldbar",              @"item_goldcoin",
+        @"item_ruby",                 @"item_trophy",
+        @"item_rare_card",            @"item_ceo_plaque",
+        @"item_ore_copper_l",         @"item_ore_copper_m",
+        @"item_ore_copper_s",         @"item_ore_gold_l",
+        @"item_ore_gold_m",           @"item_ore_gold_s",
+        @"item_ore_silver_l",         @"item_ore_silver_m",
+        @"item_ore_silver_s",         @"item_ore_hell",
+        @"item_uranium_chunk_l",      @"item_uranium_chunk_m",
+        @"item_uranium_chunk_s",      @"item_upsidedown_loot",
+        @"item_randombox_mobloot_big",@"item_randombox_mobloot_medium",
+        @"item_randombox_mobloot_small",@"item_randombox_mobloot_weapons",
+        @"item_randombox_mobloot_zombie",
+        // Food / Consumables
+        @"item_heartchocolatebox",    @"item_radioactive_broccoli",
+        @"item_shrinking_broccoli",   @"item_apple",
+        @"item_banana",               @"item_large_banana",
+        @"item_turkey_leg",           @"item_turkey_whole",
+        @"item_company_ration",       @"item_company_ration_heal",
+        @"item_cracker",              @"item_cola",
+        @"item_cola_large",           @"item_stinky_cheese",
+        @"item_egg",                  @"item_pumpkin_pie",
+        @"item_goop",                 @"item_goopfish",
+        @"item_brain_chunk",          @"item_heart_chunk",
+        @"item_zombie_meat",          @"item_nut",
+        @"item_nut_drop",
+        // Gadgets / Fun
+        @"item_boombox",              @"item_boombox_neon",
+        @"item_balloon",              @"item_balloon_heart",
+        @"item_d20",                  @"item_disc",
+        @"item_football",             @"item_rubberducky",
+        @"item_gameboy",              @"item_calculator",
+        @"item_finger_board",         @"item_glowstick",
+        @"item_snowball",             @"item_whoopie",
+        @"item_mug",                  @"item_big_cup",
+        @"item_ukulele",              @"item_ukulele_gold",
+        @"item_hawaiian_drum",        @"item_theremin",
+        @"item_box_fan",              @"item_pumpkinjack",
+        @"item_pumpkinjack_small",    @"item_robo_monke",
+        @"item_ogre_hands",           @"item_sticker_dispenser",
+        @"item_painting_canvas",      @"item_clapper",
+        @"item_cutie_dead",
+        // Office / Junk
+        @"item_stapler",              @"item_tapedispenser",
+        @"item_electrical_tape",      @"item_eraser",
+        @"item_paperpack",            @"item_floppy3",
+        @"item_floppy5",              @"item_harddrive",
+        @"item_tablet",               @"item_toilet_paper",
+        @"item_toilet_paper_mega",    @"item_toilet_paper_roll_empty",
+        @"item_umbrella",             @"item_umbrella_clover",
     ];
 }
 
 static NSArray<NSString *> *ELCategoryItems(NSInteger cat) {
     switch (cat) {
-        case 1:  return @[@"item_fishing_rod", @"item_fishing_rod_pro"];
-        case 2:  return @[@"item_fish_bass",   @"item_fish_catfish",  @"item_fish_crab",
-                          @"item_fish_eel",    @"item_fish_goldfish", @"item_fish_piranha",
-                          @"item_fish_salmon", @"item_fish_shark",    @"item_fish_trout"];
-        case 3:  return @[@"item_bait_firefly", @"item_bait_glowworm", @"item_bait_minnow"];
-        case 4:  return @[@"item_alphablade",  @"item_arena_pistol",   @"item_arena_shotgun",
-                          @"item_axe",         @"item_bat",            @"item_bow",
-                          @"item_crossbow",    @"item_dagger",         @"item_dynamite",
-                          @"item_grenade",     @"item_anti_gravity_grenade",
-                          @"item_hammer",      @"item_jetpack",        @"item_machete",
-                          @"item_pickaxe",     @"item_pistol",         @"item_rpg",
-                          @"item_rpg_ammo",    @"item_shotgun",        @"item_shovel",
-                          @"item_smg",         @"item_sniper",         @"item_staff",
-                          @"item_stash_grenade",@"item_sword",         @"item_wand"];
-        case 5:  return @[@"item_goldbar",     @"item_cash_mega_pile", @"item_coin",
-                          @"item_gem_blue",    @"item_gem_green",      @"item_gem_red",
-                          @"item_ruby",        @"item_crown",          @"item_trophy",
-                          @"item_diamond"];
-        case 6:  return @[@"item_apple",       @"item_banana",         @"item_bread",
-                          @"item_carrot",      @"item_cheese",         @"item_mushroom",
-                          @"item_egg",         @"item_water",          @"item_bone",
-                          @"item_turkey_whole",@"item_turkey_leg",     @"item_heartchocolatebox",
-                          @"item_stinky_cheese",@"item_company_ration",@"item_cracker",
-                          @"item_radioactive_broccoli"];
+        case 1: return @[  // Weapons
+            @"item_arena_pistol",         @"item_arena_shotgun",
+            @"item_revolver",             @"item_revolver_gold",
+            @"item_shotgun",              @"item_crossbow",
+            @"item_crossbow_heart",       @"item_flaregun",
+            @"item_heart_gun",            @"item_teleport_gun",
+            @"item_grenade_launcher",     @"item_rpg",
+            @"item_rpg_cny",              @"item_rpg_easter",
+            @"item_rpg_spear",            @"item_friend_launcher",
+            @"item_hookshot",             @"item_hookshot_sword",
+            @"item_lance",                @"item_viking_hammer",
+            @"item_viking_hammer_twilight",@"item_baseball_bat",
+            @"item_crowbar",              @"item_frying_pan",
+            @"item_pickaxe",              @"item_pickaxe_cny",
+            @"item_pickaxe_cube",         @"item_pinata_bat",
+            @"item_pipe",                 @"item_police_baton",
+            @"item_drill",                @"item_shredder",
+            @"item_scissors",             @"item_plunger",
+            @"item_treestick",            @"item_stick_bone",
+            @"item_stick_armbones"];
+        case 2: return @[  // Grenades
+            @"item_grenade",              @"item_grenade_gold",
+            @"item_anti_gravity_grenade", @"item_impulse_grenade",
+            @"item_cluster_grenade",      @"item_stash_grenade",
+            @"item_tele_grenade",         @"item_flashbang",
+            @"item_dynamite",             @"item_dynamite_cube",
+            @"item_sticky_dynamite",      @"item_landmine",
+            @"item_timebomb",             @"item_tripwire_explosive",
+            @"item_broccoli_grenade",     @"item_broccoli_shrink_grenade"];
+        case 3: return @[  // Valuables
+            @"item_goldbar",              @"item_goldcoin",
+            @"item_ruby",                 @"item_trophy",
+            @"item_rare_card",            @"item_ceo_plaque",
+            @"item_ore_copper_l",         @"item_ore_copper_m",
+            @"item_ore_copper_s",         @"item_ore_gold_l",
+            @"item_ore_gold_m",           @"item_ore_gold_s",
+            @"item_ore_silver_l",         @"item_ore_silver_m",
+            @"item_ore_silver_s",         @"item_ore_hell",
+            @"item_uranium_chunk_l",      @"item_uranium_chunk_m",
+            @"item_uranium_chunk_s",      @"item_upsidedown_loot",
+            @"item_randombox_mobloot_big",@"item_randombox_mobloot_medium",
+            @"item_randombox_mobloot_small",@"item_randombox_mobloot_weapons",
+            @"item_randombox_mobloot_zombie"];
+        case 4: return @[  // Food
+            @"item_heartchocolatebox",    @"item_radioactive_broccoli",
+            @"item_shrinking_broccoli",   @"item_apple",
+            @"item_banana",               @"item_large_banana",
+            @"item_turkey_leg",           @"item_turkey_whole",
+            @"item_company_ration",       @"item_company_ration_heal",
+            @"item_cracker",              @"item_cola",
+            @"item_cola_large",           @"item_stinky_cheese",
+            @"item_egg",                  @"item_pumpkin_pie",
+            @"item_goop",                 @"item_goopfish",
+            @"item_brain_chunk",          @"item_heart_chunk",
+            @"item_zombie_meat",          @"item_nut",
+            @"item_nut_drop"];
+        case 5: return @[  // Tools
+            @"item_flashlight",           @"item_flashlight_mega",
+            @"item_flashlight_red",       @"item_jetpack",
+            @"item_hoverpad",             @"item_pogostick",
+            @"item_zipline_gun",          @"item_portable_teleporter",
+            @"item_rope",                 @"item_scanner",
+            @"item_disposable_camera",    @"item_server_pad",
+            @"item_keycard",              @"item_hh_key",
+            @"item_saddle",               @"item_backpack",
+            @"item_backpack_large_base",  @"item_backpack_with_flashlight",
+            @"item_pelican_case"];
+        case 6: return @[  // Fun / Gadgets
+            @"item_boombox",              @"item_boombox_neon",
+            @"item_balloon",              @"item_balloon_heart",
+            @"item_d20",                  @"item_disc",
+            @"item_football",             @"item_rubberducky",
+            @"item_gameboy",              @"item_calculator",
+            @"item_finger_board",         @"item_glowstick",
+            @"item_snowball",             @"item_whoopie",
+            @"item_ukulele",              @"item_ukulele_gold",
+            @"item_hawaiian_drum",        @"item_theremin",
+            @"item_robo_monke",           @"item_ogre_hands",
+            @"item_pumpkinjack",          @"item_pumpkinjack_small",
+            @"item_cutie_dead"];
         default: return ELAllItems();
     }
 }
@@ -208,13 +523,20 @@ static NSArray<NSString *> *ELCategoryItems(NSInteger cat) {
 // ─── JSON Config Writer ───────────────────────────────────────────────────────
 static NSDictionary *ELMakeItemNode(NSString *itemID, NSInteger hue, NSInteger sat,
                                      NSInteger scale, NSInteger count, NSArray *children) {
+    // Grab camera world position so the item spawns at the player's viewpoint
+    ELVec3 pos = ELCameraPosition();
     NSMutableDictionary *node = [@{
-        @"itemID"        : itemID,
-        @"colorHue"      : @(hue),
-        @"colorSaturation": @(sat),
-        @"scaleModifier" : @(scale),
-        @"state"         : @(0),
-        @"count"         : @(count),
+        @"itemID"          : itemID,
+        @"colorHue"        : @(hue),
+        @"colorSaturation" : @(sat),
+        @"scaleModifier"   : @(scale),
+        @"state"           : @(1),   // 1 = pending spawn (0 = already processed)
+        @"count"           : @(count),
+        @"position"        : @{
+            @"x" : @(pos.x),
+            @"y" : @(pos.y),
+            @"z" : @(pos.z),
+        },
     } mutableCopy];
     if (children.count > 0) node[@"children"] = children;
     return [node copy];
@@ -237,7 +559,7 @@ static BOOL ELWriteConfig(NSString *slot, NSString *itemID, NSInteger hue, NSInt
         for (NSInteger i = 1; i < count; i++)
             [childNodes addObject:ELMakeItemNode(itemID, hue, sat, 0, 1, nil)];
     }
-    config[slot] = ELMakeItemNode(itemID, hue, sat, scale, 1,
+    config[slot] = ELMakeItemNode(itemID, hue, sat, scale, count,
                                   childNodes.count > 0 ? childNodes : nil);
     NSData *data = [NSJSONSerialization dataWithJSONObject:config
                                                   options:NSJSONWritingPrettyPrinted error:nil];
@@ -258,6 +580,538 @@ static void ELClearSlot(NSString *slot) {
     NSData *data = [NSJSONSerialization dataWithJSONObject:config
                                                   options:NSJSONWritingPrettyPrinted error:nil];
     [data writeToFile:path atomically:YES];
+}
+
+
+// ─── Monsters ─────────────────────────────────────────────────────────────────
+// Internal IDs derived from the Animal Company VR wiki monster list.
+// Pattern mirrors the item_* convention; prefixed with "monster_" / "enemy_".
+static NSArray<NSString *> *ELAllMonsters(void) {
+    return @[
+        // Humanoid
+        @"ArmstrongController",        @"ArmstrongMadController",
+        @"LankyController",            @"GiantController",
+        @"FakeGorillaController",      @"NextBotController",
+        @"NextBotStaticController",    @"PhantomController",
+        // Creature
+        @"AnglerController",           @"AnglerMadController",
+        @"ChickenController",          @"SpiderController",
+        @"SpiderCaveController",       @"FlyingSwarmController",
+        // Ambient / Weird
+        @"BansheeController",          @"CutieController",
+        @"CystController",             @"EvilEyeController",
+        @"EvilEyePinataController",    @"EvilEyePinataLargeController",
+        @"BlobController",             @"RedGreenController",
+        @"RedGreenMadController",      @"SegwayController",
+        // Explosive
+        @"BombController",             @"BomberController",
+        @"BomberFlashbangController",  @"BomberMadController",
+    ];
+}
+
+// Category sub-lists for the filter pills
+static NSArray<NSString *> *ELMonsterCategory(NSInteger cat) {
+    switch (cat) {
+        case 1: return @[  // Humanoid
+            @"ArmstrongController",    @"ArmstrongMadController",
+            @"LankyController",        @"GiantController",
+            @"FakeGorillaController",  @"NextBotController",
+            @"NextBotStaticController",@"PhantomController"];
+        case 2: return @[  // Creature
+            @"AnglerController",       @"AnglerMadController",
+            @"ChickenController",      @"SpiderController",
+            @"SpiderCaveController",   @"FlyingSwarmController"];
+        case 3: return @[  // Ambient
+            @"BansheeController",      @"CutieController",
+            @"CystController",         @"EvilEyeController",
+            @"EvilEyePinataController",@"EvilEyePinataLargeController",
+            @"BlobController",         @"RedGreenController",
+            @"RedGreenMadController",  @"SegwayController"];
+        case 4: return @[  // Explosive
+            @"BombController",         @"BomberController",
+            @"BomberFlashbangController",@"BomberMadController"];
+        default: return ELAllMonsters();
+    }
+}
+
+// Friendly display name — strip "Controller" suffix, insert spaces before capitals
+static NSString *ELMonsterDisplayName(NSString *monsterID) {
+    NSString *s = [monsterID stringByReplacingOccurrencesOfString:@"Controller" withString:@""];
+    // Insert space before each capital letter that follows a lowercase letter
+    NSMutableString *result = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (i > 0 && isupper(c) && islower([s characterAtIndex:i-1]))
+            [result appendString:@" "];
+        [result appendFormat:@"%C", c];
+    }
+    return result;
+}
+
+// ─── Monster Config Writer ─────────────────────────────────────────────────────
+// Writes a spawn request into animal-company-config.json under a "monsters" key.
+// colorTint is 0–360 hue, scale is a float multiplier (1.0 = normal).
+static BOOL ELSpawnMonster(NSString *monsterID, CGFloat scale, NSInteger colorHue, NSInteger qty) {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    ELVec3 pos = ELCameraPosition();
+
+    // Build the spawn entry — try both key conventions the game might read
+    NSMutableArray *spawnList = [NSMutableArray array];
+    for (NSInteger i = 0; i < MAX(1, qty); i++) {
+        [spawnList addObject:@{
+            @"monsterID"      : monsterID,
+            @"enemyID"        : monsterID,         // alternate key
+            @"id"             : monsterID,
+            @"type"           : monsterID,
+            @"scale"          : @(scale),
+            @"size"           : @(scale),
+            @"scaleModifier"  : @(scale),
+            @"colorHue"       : @(colorHue),
+            @"color"          : @(colorHue),
+            @"tintHue"        : @(colorHue),
+            @"state"          : @(1),
+            @"position"       : @{ @"x": @(pos.x), @"y": @(pos.y), @"z": @(pos.z) },
+        }];
+    }
+
+    // Write under every plausible top-level key
+    config[@"monsters"]      = spawnList;
+    config[@"monsterSpawns"] = spawnList;
+    config[@"enemySpawns"]   = spawnList;
+    config[@"spawnMonsters"] = spawnList;
+    config[@"enemies"]       = spawnList;
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
+}
+
+// ─── Player Scale Writer ──────────────────────────────────────────────────────
+// Writes body size multiplier under every plausible key the game might read.
+// 1.0 = normal, >1 = giant, <1 = tiny.
+static BOOL ELWritePlayerScale(CGFloat scale) {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData       *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    config[@"playerScale"]     = @(scale);
+    config[@"bodyScale"]       = @(scale);
+    config[@"playerSize"]      = @(scale);
+    config[@"characterScale"]  = @(scale);
+    config[@"sizeMultiplier"]  = @(scale);
+    config[@"scaleMultiplier"] = @(scale);
+    config[@"vrPlayerScale"]   = @(scale);
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
+}
+
+// ─── Money Writer ─────────────────────────────────────────────────────────────
+// Writes all known Nuts key variants into the config so at least one hits.
+static BOOL ELWriteMoney(long long nuts) {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData       *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    config[@"nuts"]        = @(nuts);
+    config[@"money"]       = @(nuts);
+    config[@"bolts"]       = @(nuts);
+    config[@"dollars"]     = @(nuts);
+    config[@"currency"]    = @(nuts);
+    config[@"nutCount"]    = @(nuts);
+    config[@"nutsAmount"]  = @(nuts);
+    config[@"playerNuts"]  = @(nuts);
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK: — Infinite Ammo
+//
+// Two-pronged approach so at least one hits regardless of how the game stores ammo:
+//
+//   A) Config JSON  — writes every plausible ammo/magazine key into the config file
+//      so the game reads max ammo on the next load/reload tick.
+//
+//   B) IL2CPP hooks — patches the get_currentAmmo / get_magazineAmmo accessors
+//      in the live IL2CPP runtime so ammo never decreases while the feature is on.
+//      Works even without a game restart.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── A: Runtime toggle flag ────────────────────────────────────────────────────
+static BOOL gInfAmmoEnabled = NO;
+
+// ── B: IL2CPP function-pointer types ─────────────────────────────────────────
+// These match the Unity IL2CPP generated signatures for property getters.
+// The game subclasses a base Weapon/Gun component — we hook the icall variants.
+typedef int   (*AmmoGetter)(Il2CppObject *);
+typedef void  (*AmmoSetter)(Il2CppObject *, int);
+
+// Cached original getters (so we can restore them on toggle-off)
+static AmmoGetter _orig_getCurrentAmmo  = NULL;
+static AmmoGetter _orig_getMagazineAmmo = NULL;
+
+// ── Hooked getter shims ───────────────────────────────────────────────────────
+// When inf-ammo is ON, return INT_MAX for any ammo getter the game calls.
+static int EL_hooked_getCurrentAmmo(Il2CppObject *self) {
+    if (gInfAmmoEnabled) return 9999;
+    return _orig_getCurrentAmmo ? _orig_getCurrentAmmo(self) : 9999;
+}
+static int EL_hooked_getMagazineAmmo(Il2CppObject *self) {
+    if (gInfAmmoEnabled) return 9999;
+    return _orig_getMagazineAmmo ? _orig_getMagazineAmmo(self) : 9999;
+}
+
+// ── Resolve + patch the icalls ────────────────────────────────────────────────
+// Animal Company uses Unity 2022 IL2CPP. The weapon classes are most likely
+// named GunItem, WeaponItem, or ProjectileWeapon. We try every plausible
+// icall string — whichever resolves first wins.
+static void ELPatchAmmoIcalls(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!il2cpp_resolve_icall) return;
+
+        // Candidate icall strings for current-ammo getter
+        const char *currentAmmoCandidates[] = {
+            "AnimalCompany.GunItem::get_currentAmmo",
+            "AnimalCompany.WeaponItem::get_currentAmmo",
+            "AnimalCompany.ProjectileWeapon::get_currentAmmo",
+            "AnimalCompany.RangedWeapon::get_currentAmmo",
+            "AnimalCompany.Gun::get_currentAmmo",
+            "AnimalCompany.FirearmComponent::get_currentAmmo",
+            "AnimalCompany.AmmoComponent::get_currentAmmo",
+            NULL
+        };
+        // Candidate icall strings for magazine/clip getter
+        const char *magazineCandidates[] = {
+            "AnimalCompany.GunItem::get_magazineAmmo",
+            "AnimalCompany.GunItem::get_clipSize",
+            "AnimalCompany.WeaponItem::get_magazineAmmo",
+            "AnimalCompany.ProjectileWeapon::get_magazineSize",
+            "AnimalCompany.RangedWeapon::get_magazineAmmo",
+            "AnimalCompany.Gun::get_magazineAmmo",
+            "AnimalCompany.FirearmComponent::get_magazineAmmo",
+            "AnimalCompany.AmmoComponent::get_magazineSize",
+            NULL
+        };
+
+        for (int i = 0; currentAmmoCandidates[i]; i++) {
+            void *fn = il2cpp_resolve_icall(currentAmmoCandidates[i]);
+            if (fn) {
+                void *origCA = NULL;
+                ELHookFunction(fn, (void *)EL_hooked_getCurrentAmmo, &origCA);
+                _orig_getCurrentAmmo = (AmmoGetter)origCA;
+                NSLog(@"[EverLight] ∞ Ammo: hooked currentAmmo → %s", currentAmmoCandidates[i]);
+                break;
+            }
+        }
+        for (int i = 0; magazineCandidates[i]; i++) {
+            void *fn = il2cpp_resolve_icall(magazineCandidates[i]);
+            if (fn) {
+                void *origMA = NULL;
+                ELHookFunction(fn, (void *)EL_hooked_getMagazineAmmo, &origMA);
+                _orig_getMagazineAmmo = (AmmoGetter)origMA;
+                NSLog(@"[EverLight] ∞ Ammo: hooked magazineAmmo → %s", magazineCandidates[i]);
+                break;
+            }
+        }
+    });
+}
+
+// ── C: Config JSON writer (covers load-time ammo restoration) ─────────────────
+// Writes every plausible ammo key so the game's save-system restores full ammo.
+static BOOL ELWriteInfAmmo(void) {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData       *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+
+    // ── All plausible ammo key names (cast wide net) ──────────────────────────
+    NSNumber *big = @9999;
+    // Generic ammo
+    config[@"ammo"]              = big;
+    config[@"currentAmmo"]       = big;
+    config[@"ammoCount"]         = big;
+    config[@"ammoAmount"]        = big;
+    config[@"totalAmmo"]         = big;
+    config[@"remainingAmmo"]     = big;
+    config[@"playerAmmo"]        = big;
+    // Magazine / clip
+    config[@"magazineAmmo"]      = big;
+    config[@"magazineSize"]      = big;
+    config[@"clipSize"]          = big;
+    config[@"clipAmmo"]          = big;
+    config[@"currentClip"]       = big;
+    config[@"bulletsLeft"]       = big;
+    config[@"bulletsInMag"]      = big;
+    config[@"roundsLeft"]        = big;
+    config[@"roundsInChamber"]   = big;
+    // Per-weapon type keys
+    config[@"pistolAmmo"]        = big;
+    config[@"shotgunAmmo"]       = big;
+    config[@"smgAmmo"]           = big;
+    config[@"sniperAmmo"]        = big;
+    config[@"rpgAmmo"]           = big;
+    config[@"bowAmmo"]           = big;
+    config[@"crossbowAmmo"]      = big;
+    config[@"arenaAmmo"]         = big;
+    // Infinite flag (some games use a bool)
+    config[@"infiniteAmmo"]      = @YES;
+    config[@"infAmmo"]           = @YES;
+    config[@"unlimitedAmmo"]     = @YES;
+
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
+}
+
+// ── D: Toggle handler (called from UI switch) ─────────────────────────────────
+static void ELToggleInfAmmo(BOOL enable) {
+    gInfAmmoEnabled = enable;
+    if (enable) {
+        // Attempt IL2CPP hook (once)
+        ELPatchAmmoIcalls();
+        // Also write to config
+        ELWriteInfAmmo();
+    }
+    NSLog(@"[EverLight] Infinite Ammo: %@", enable ? @"ON" : @"OFF");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK: — Freeze All Monsters
+// Two-pronged: writes freeze flags to config AND hooks the monster AI Update
+// via IL2CPP so they stop ticking in real time without needing a restart.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static BOOL gFreezeEnabled = NO;
+
+// The AI Update method runs every frame — we replace it with a no-op when frozen.
+typedef void (*MonsterUpdateFn)(Il2CppObject *);
+static MonsterUpdateFn _orig_monsterUpdate  = NULL;
+static MonsterUpdateFn _orig_monsterUpdate2 = NULL;
+
+static void EL_hooked_monsterUpdate(__unused Il2CppObject *self)  { /* frozen — do nothing */ }
+static void EL_hooked_monsterUpdate2(__unused Il2CppObject *self) { /* frozen — do nothing */ }
+
+static void ELPatchFreezeIcalls(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!il2cpp_resolve_icall) return;
+        // Primary AI update candidates
+        const char *updateCandidates[] = {
+            "AnimalCompany.MonsterAI::Update",
+            "AnimalCompany.EnemyAI::Update",
+            "AnimalCompany.CreatureAI::Update",
+            "AnimalCompany.BaseMonster::Update",
+            "AnimalCompany.MonsterController::Update",
+            "AnimalCompany.EnemyController::Update",
+            NULL
+        };
+        // Secondary / movement tick candidates
+        const char *moveCandidates[] = {
+            "AnimalCompany.MonsterAI::DoAIInterval",
+            "AnimalCompany.EnemyAI::DoAIInterval",
+            "AnimalCompany.MonsterAI::MoveTowardsPlayer",
+            "AnimalCompany.EnemyAI::MoveTowardsPlayer",
+            NULL
+        };
+        for (int i = 0; updateCandidates[i]; i++) {
+            void *fn = il2cpp_resolve_icall(updateCandidates[i]);
+            if (fn) {
+                void *orig = NULL;
+                ELHookFunction(fn, (void *)EL_hooked_monsterUpdate, &orig);
+                _orig_monsterUpdate = (MonsterUpdateFn)orig;
+                NSLog(@"[EverLight] ❄️ Freeze: hooked Update → %s", updateCandidates[i]);
+                break;
+            }
+        }
+        for (int i = 0; moveCandidates[i]; i++) {
+            void *fn = il2cpp_resolve_icall(moveCandidates[i]);
+            if (fn) {
+                void *orig = NULL;
+                ELHookFunction(fn, (void *)EL_hooked_monsterUpdate2, &orig);
+                _orig_monsterUpdate2 = (MonsterUpdateFn)orig;
+                NSLog(@"[EverLight] ❄️ Freeze: hooked move tick → %s", moveCandidates[i]);
+                break;
+            }
+        }
+    });
+}
+
+static BOOL ELWriteFreezeConfig(BOOL enable) {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    config[@"freezeMonsters"]  = @(enable);
+    config[@"freezeEnemies"]   = @(enable);
+    config[@"pauseAI"]         = @(enable);
+    config[@"disableAI"]       = @(enable);
+    config[@"monstersFrozen"]  = @(enable);
+    config[@"enemyAIDisabled"] = @(enable);
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    return [data writeToFile:path atomically:YES];
+}
+
+static void ELToggleFreeze(BOOL enable) {
+    gFreezeEnabled = enable;
+    if (enable) ELPatchFreezeIcalls();
+    ELWriteFreezeConfig(enable);
+    ELToast(enable ? @"❄️ Monsters Frozen" : @"❄️ Monsters Unfrozen", enable);
+    NSLog(@"[EverLight] Freeze Monsters: %@", enable ? @"ON" : @"OFF");
+}
+
+static void ELToggleFreeze(BOOL enable) {
+    gFreezeEnabled = enable;
+    if (enable) ELPatchFreezeIcalls();
+    ELWriteFreezeConfig(enable);
+    ELToast(enable ? @"❄️ Monsters Frozen" : @"❄️ Monsters Unfrozen", enable);
+    NSLog(@"[EverLight] Freeze Monsters: %@", enable ? @"ON" : @"OFF");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK: — Fling (RPC_Teleport)
+// Each tap teleports the player forward using the game's own RPC_Teleport call.
+// We compute the target position from camera pos + camera forward direction,
+// stepping a fixed distance each tap — feels like a fling/dash.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+static BOOL    gFlingEnabled = NO;
+static UIView *gFlingOverlay = nil;   // fullscreen tap catcher
+static CGFloat gFlingDist    = 8.0f; // metres per tap — tuneable
+
+// RPC_Teleport signature: (Il2CppObject *instance, Vector3 position)
+typedef void (*RPC_Teleport_t)(Il2CppObject *, ELVec3);
+static RPC_Teleport_t _RPC_Teleport = NULL;
+
+typedef Il2CppObject* (*GetLocalPlayer_t)(void);
+static GetLocalPlayer_t _getLocalPlayer = NULL;
+
+static void ELResolveTeleport(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // RPC_Teleport is a Photon RPC method on the player class, not a Unity icall.
+        // We use il2cpp_domain/class/method APIs to find and cache it.
+        void *domain = il2cpp_domain_get ? il2cpp_domain_get() : NULL;
+        if (!domain) { NSLog(@"[EverLight] il2cpp_domain_get unavailable"); return; }
+
+        // Try each plausible class name
+        const char *classNames[] = {
+            "PlayerController",
+            "PlayerMovement",
+            "VRPlayer",
+            "PlayerBody",
+            NULL
+        };
+        const char *namespaces[] = {
+            "AnimalCompany", "", NULL
+        };
+
+        for (int ni = 0; namespaces[ni]; ni++) {
+            for (int ci = 0; classNames[ci]; ci++) {
+                void *klass = il2cpp_class_from_name
+                    ? il2cpp_class_from_name(il2cpp_assembly_get_image(il2cpp_domain_assembly_open(domain, "Assembly-CSharp")),
+                                             namespaces[ni], classNames[ci])
+                    : NULL;
+                if (!klass) continue;
+
+                void *method = il2cpp_class_get_method_from_name
+                    ? il2cpp_class_get_method_from_name(klass, "RPC_Teleport", 1)
+                    : NULL;
+                if (!method) continue;
+
+                _RPC_Teleport = (RPC_Teleport_t)il2cpp_method_get_pointer(method);
+                NSLog(@"[EverLight] 🚀 RPC_Teleport resolved on %s::%s", namespaces[ni], classNames[ci]);
+                return;
+            }
+        }
+        NSLog(@"[EverLight] 🚀 RPC_Teleport not found — fling will silently no-op");
+    });
+}
+
+static void ELDoFling(void) {
+    if (!_RPC_Teleport) { ELToast(@"RPC_Teleport not resolved", NO); return; }
+
+    Il2CppObject *player = _getLocalPlayer ? _getLocalPlayer() : NULL;
+    if (!player) { ELToast(@"Player not found", NO); return; }
+
+    // Get camera position + derive forward vector from quaternion
+    ELVec3 pos = ELCameraPosition();
+    ELQuat rot = ELCameraRotation();
+
+    float x = rot.x, y = rot.y, z = rot.z, w = rot.w;
+    float fwdX = 2*(x*z + w*y);
+    float fwdY = 2*(y*z - w*x);
+    float fwdZ = 1 - 2*(x*x + y*y);
+    float len  = sqrtf(fwdX*fwdX + fwdY*fwdY + fwdZ*fwdZ);
+    if (len > 0.001f) { fwdX /= len; fwdY /= len; fwdZ /= len; }
+
+    // Target: step forward, keep Y flat so it doesn't send you into the ground/sky
+    ELVec3 target = {
+        pos.x + fwdX * gFlingDist,
+        pos.y,
+        pos.z + fwdZ * gFlingDist,
+    };
+
+    _RPC_Teleport(player, target);
+}
+
+static void ELToggleFling(BOOL enable);
+static void ELToggleFling(BOOL enable) {
+    gFlingEnabled = enable;
+    ELResolveTeleport();
+
+    if (enable) {
+        if (gFlingOverlay) return;
+        UIWindow *win = ELKeyWindow();
+        if (!win) return;
+
+        gFlingOverlay = [[UIView alloc] initWithFrame:win.bounds];
+        gFlingOverlay.backgroundColor        = [UIColor clearColor];
+        gFlingOverlay.userInteractionEnabled = YES;
+        [win insertSubview:gFlingOverlay atIndex:0];
+
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+        [tap el_addBlock:^(__unused id s) { if (gFlingEnabled) ELDoFling(); }];
+        [gFlingOverlay addGestureRecognizer:tap];
+
+        ELToast(@"🚀 Fling ON — tap to teleport forward", YES);
+    } else {
+        [gFlingOverlay removeFromSuperview];
+        gFlingOverlay = nil;
+        ELToast(@"🚀 Fling OFF", NO);
+    }
+    NSLog(@"[EverLight] Fling: %@", enable ? @"ON" : @"OFF");
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
@@ -310,7 +1164,7 @@ static void ELToast(NSString *msg, BOOL success) {
 @property (nonatomic, assign) NSInteger scaleVal;
 @property (nonatomic, assign) NSInteger quantity;
 @property (nonatomic, strong) UIView         *itemsPage;
-@property (nonatomic, strong) UIView         *settingsPage;
+@property (nonatomic, strong) UIScrollView   *settingsPage;
 @property (nonatomic, strong) UIScrollView   *itemList;
 @property (nonatomic, strong) UITextField    *searchField;
 @property (nonatomic, strong) UILabel        *selectedItemLabel;
@@ -322,6 +1176,27 @@ static void ELToast(NSString *msg, BOOL success) {
 @property (nonatomic, strong) UILabel        *countLabel;
 @property (nonatomic, strong) NSArray        *currentItems;
 @property (nonatomic, strong) NSMutableArray *rowViews;
+@property (nonatomic, assign) CGFloat menuRotation;
+// Inline spawn controls on Items page
+@property (nonatomic, strong) UIView  *itemColorSwatch;
+@property (nonatomic, strong) UILabel *itemHueValueLabel;
+@property (nonatomic, strong) UILabel *itemSatValueLabel;
+@property (nonatomic, strong) UILabel *itemScaleValueLabel;
+// Monster tab state
+@property (nonatomic, strong) UIView       *monstersPage;
+@property (nonatomic, strong) UIScrollView *monsterList;
+@property (nonatomic, strong) UITextField  *monsterSearchField;
+@property (nonatomic, strong) UILabel      *selectedMonsterLabel;
+@property (nonatomic, strong) NSString     *selectedMonster;
+@property (nonatomic, strong) NSArray      *currentMonsters;
+@property (nonatomic, strong) NSMutableArray *monsterRowViews;
+@property (nonatomic, assign) NSInteger    monsterQty;
+@property (nonatomic, assign) NSInteger    monsterColorHue;
+@property (nonatomic, assign) CGFloat      monsterScale;
+@property (nonatomic, strong) UILabel      *monsterQtyLabel;
+@property (nonatomic, strong) UILabel      *monsterScaleLabel;
+@property (nonatomic, strong) UILabel      *monsterHueLabel;
+@property (nonatomic, assign) NSInteger    monsterCatIndex;
 @end
 
 @implementation EverLightMenu
@@ -338,6 +1213,13 @@ static void ELToast(NSString *msg, BOOL success) {
     _quantity         = 1;
     _currentItems     = ELAllItems();
     _rowViews         = [NSMutableArray array];
+    _currentMonsters  = ELAllMonsters();
+    _monsterRowViews  = [NSMutableArray array];
+    _monsterQty       = 1;
+    _monsterColorHue  = 0;
+    _monsterScale     = 1.0f;
+    _monsterCatIndex  = 0;
+    _menuRotation     = 0;
     [self buildUI];
     return self;
 }
@@ -408,9 +1290,23 @@ static void ELToast(NSString *msg, BOOL success) {
     closeBtn.layer.borderWidth  = 1;
     closeBtn.layer.borderColor  = EL_BORDER;
     UITapGestureRecognizer *ct = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [ct addTarget:^(__unused id s) { [self dismiss]; } withObject:nil];
+    [ct el_addBlock:^(__unused id s) { [self dismiss]; }];
     [closeBtn addGestureRecognizer:ct];
     [clip addSubview:closeBtn];
+
+    // Rotate button
+    UIButton *rotateBtn = [[UIButton alloc] initWithFrame:CGRectMake(w - 38, 12, 28, 28)];
+    [rotateBtn setTitle:@"↻" forState:UIControlStateNormal];
+    [rotateBtn setTitleColor:EL_PURPLE forState:UIControlStateNormal];
+    rotateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    rotateBtn.backgroundColor  = EL_PURPLE_DIM;
+    rotateBtn.layer.cornerRadius = 14;
+    rotateBtn.layer.borderWidth  = 1;
+    rotateBtn.layer.borderColor  = EL_BORDER;
+    UITapGestureRecognizer *rt = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+    [rt el_addBlock:^(__unused id s) { [self rotateMenu]; }];
+    [rotateBtn addGestureRecognizer:rt];
+    [clip addSubview:rotateBtn];
 
     // Title
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 13, w, 24)];
@@ -433,14 +1329,22 @@ static void ELToast(NSString *msg, BOOL success) {
     // Pages
     CGRect pageFrame  = CGRectMake(0, 96, w, h - 96);
     _itemsPage        = [[UIView alloc] initWithFrame:pageFrame];
-    _settingsPage     = [[UIView alloc] initWithFrame:pageFrame];
+    _settingsPage     = [[UIScrollView alloc] initWithFrame:pageFrame];
     _settingsPage.hidden       = YES;
     _itemsPage.backgroundColor    = [UIColor clearColor];
     _settingsPage.backgroundColor = [UIColor clearColor];
+    _settingsPage.showsVerticalScrollIndicator = NO;
     [clip addSubview:_itemsPage];
     [clip addSubview:_settingsPage];
 
+    // Monsters page
+    _monstersPage = [[UIView alloc] initWithFrame:pageFrame];
+    _monstersPage.hidden       = YES;
+    _monstersPage.backgroundColor = [UIColor clearColor];
+    [clip addSubview:_monstersPage];
+
     [self buildItemsPage];
+    [self buildMonstersPage];
     [self buildSettingsPage];
 }
 
@@ -452,7 +1356,7 @@ static void ELToast(NSString *msg, BOOL success) {
     bar.layer.borderWidth  = 1;
     bar.layer.borderColor  = EL_BORDER;
 
-    NSArray  *tabs = @[@"Items", @"Settings"];
+    NSArray  *tabs = @[@"Items", @"Monsters", @"Settings"];
     // FIX 3 — cast to NSInteger to avoid signed/unsigned mismatch
     NSInteger tabCount = (NSInteger)tabs.count;
     CGFloat   tw       = (w - 20) / tabCount;
@@ -476,7 +1380,7 @@ static void ELToast(NSString *msg, BOOL success) {
         NSInteger ci = i;
         UIView *b2   = bar;
         CGFloat tw2  = tw;
-        [t addTarget:^(__unused id s) { [self switchToTab:ci bar:b2 tabW:tw2]; } withObject:nil];
+        [t el_addBlock:^(__unused id s) { [self switchToTab:ci bar:b2 tabW:tw2]; }];
         [btn addGestureRecognizer:t];
         [bar addSubview:btn];
     }
@@ -486,14 +1390,15 @@ static void ELToast(NSString *msg, BOOL success) {
 - (void)switchToTab:(NSInteger)idx bar:(UIView *)bar tabW:(CGFloat)tw {
     _selectedTab             = idx;
     _itemsPage.hidden        = (idx != 0);
-    _settingsPage.hidden     = (idx != 1);
+    _monstersPage.hidden     = (idx != 1);
+    _settingsPage.hidden     = (idx != 2);
     UIView *ind = [bar viewWithTag:9001];
     [UIView animateWithDuration:0.22 delay:0 usingSpringWithDamping:0.75
            initialSpringVelocity:0.5 options:0
                        animations:^{
         ind.frame = CGRectMake(tw * idx + 2, 2, tw - 4, 32);
     } completion:nil];
-    for (NSInteger i = 0; i < 2; i++) {
+    for (NSInteger i = 0; i < 3; i++) {
         UIButton *b = (UIButton *)[bar viewWithTag:8000 + i];
         [b setTitleColor:(i == idx ? EL_STAR : EL_TEXT_DIM) forState:UIControlStateNormal];
     }
@@ -509,7 +1414,7 @@ static void ELToast(NSString *msg, BOOL success) {
     catScroll.showsHorizontalScrollIndicator = NO;
     catScroll.backgroundColor = [UIColor clearColor];
 
-    NSArray   *cats    = @[@"All", @"Rods", @"Fish", @"Baits", @"Weapons", @"Valuables", @"Food"];
+    NSArray   *cats    = @[@"All", @"Weapons", @"Grenades", @"Valuables", @"Food", @"Tools", @"Fun"];
     NSInteger  catCount = (NSInteger)cats.count;  // FIX 3
     CGFloat    cx      = 8;
 
@@ -531,7 +1436,7 @@ static void ELToast(NSString *msg, BOOL success) {
         UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
         NSInteger    ci = i;
         UIScrollView *cs = catScroll;
-        [t addTarget:^(__unused id s) { [self selectCategory:ci scroll:cs]; } withObject:nil];
+        [t el_addBlock:^(__unused id s) { [self selectCategory:ci scroll:cs]; }];
         [pill addGestureRecognizer:t];
         [catScroll addSubview:pill];
         cx += pw + 6;
@@ -599,9 +1504,9 @@ static void ELToast(NSString *msg, BOOL success) {
     _selectedItemLabel.textColor = EL_TEXT_DIM;
     [selWrap addSubview:_selectedItemLabel];
 
-    // Item list
-    CGFloat listH = h - 282;
-    _itemList = [[UIScrollView alloc] initWithFrame:CGRectMake(10, 131, w - 20, listH)];
+    // Item list — shorter to fit the expanded color+size panel (178 pt) + spawn row (44 pt)
+    CGFloat listH = h - 468;
+    _itemList = [[UIScrollView alloc] initWithFrame:CGRectMake(10, 131, w - 20, MAX(listH, 60))];
     _itemList.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
     _itemList.layer.cornerRadius = 10;
     _itemList.layer.borderWidth  = 1;
@@ -609,60 +1514,164 @@ static void ELToast(NSString *msg, BOOL success) {
     [_itemsPage addSubview:_itemList];
     [self reloadItemList];
 
-    CGFloat by = 131 + listH + 8;
+    // ── Inline spawn-controls panel ────────────────────────────────────────────
+    CGFloat panelY = 131 + MAX(listH, 60) + 8;
+    CGFloat panelH = 178;
+    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(10, panelY, w - 20, panelH)];
+    panel.backgroundColor    = [UIColor colorWithWhite:0 alpha:0.35];
+    panel.layer.cornerRadius = 10;
+    panel.layer.borderWidth  = 1;
+    panel.layer.borderColor  = EL_BORDER;
+    [_itemsPage addSubview:panel];
 
-    // Quantity stepper
-    UILabel *ql = [[UILabel alloc] initWithFrame:CGRectMake(12, by, 30, 28)];
+    CGFloat pw = w - 20;  // panel inner width
+
+    // ── Big live color swatch (top-right, spans colour rows) ─────────────────
+    CGFloat swatchSz = 40;
+    _itemColorSwatch = [[UIView alloc] initWithFrame:CGRectMake(pw - swatchSz - 8, 8, swatchSz, swatchSz)];
+    _itemColorSwatch.layer.cornerRadius = 8;
+    _itemColorSwatch.layer.borderWidth  = 2.0f;
+    _itemColorSwatch.layer.borderColor  = EL_BORDER;
+    _itemColorSwatch.backgroundColor    = [UIColor colorWithHue:_colorHue / 360.0f
+                                                     saturation:_colorSat / 255.0f
+                                                     brightness:1.0f alpha:1.0f];
+    [panel addSubview:_itemColorSwatch];
+
+    // ── Row 1: Hue ────────────────────────────────────────────────────────────
+    UILabel *colorHdr = [[UILabel alloc] initWithFrame:CGRectMake(10, 8, 52, 14)];
+    colorHdr.text      = @"🎨 COLOR";
+    colorHdr.font      = [UIFont boldSystemFontOfSize:9];
+    colorHdr.textColor = EL_TEXT_DIM;
+    [panel addSubview:colorHdr];
+
+    UILabel *hueTitleLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 24, 36, 14)];
+    hueTitleLbl.text      = @"Hue";
+    hueTitleLbl.font      = [UIFont boldSystemFontOfSize:10];
+    hueTitleLbl.textColor = EL_TEXT;
+    [panel addSubview:hueTitleLbl];
+
+    _itemHueValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(48, 24, 54, 14)];
+    _itemHueValueLabel.text          = [NSString stringWithFormat:@"%ld°", (long)_colorHue];
+    _itemHueValueLabel.font          = [UIFont boldSystemFontOfSize:10];
+    _itemHueValueLabel.textColor     = EL_PINK;
+    [panel addSubview:_itemHueValueLabel];
+
+    UISlider *hueSlider = [[UISlider alloc] initWithFrame:CGRectMake(10, 40, pw - swatchSz - 28, 20)];
+    hueSlider.minimumValue          = 0;
+    hueSlider.maximumValue          = 360;
+    hueSlider.value                 = _colorHue;
+    hueSlider.minimumTrackTintColor = EL_PURPLE;
+    hueSlider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.12];
+    hueSlider.thumbTintColor        = [UIColor whiteColor];
+    [hueSlider addTarget:self action:@selector(itemHueChanged:)
+        forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:hueSlider];
+
+    // ── Row 2: Saturation ─────────────────────────────────────────────────────
+    UILabel *satTitleLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 64, 36, 14)];
+    satTitleLbl.text      = @"Sat";
+    satTitleLbl.font      = [UIFont boldSystemFontOfSize:10];
+    satTitleLbl.textColor = EL_TEXT;
+    [panel addSubview:satTitleLbl];
+
+    _itemSatValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(48, 64, 54, 14)];
+    _itemSatValueLabel.text      = [NSString stringWithFormat:@"%ld", (long)_colorSat];
+    _itemSatValueLabel.font      = [UIFont boldSystemFontOfSize:10];
+    _itemSatValueLabel.textColor = EL_PINK;
+    [panel addSubview:_itemSatValueLabel];
+
+    UISlider *satSlider = [[UISlider alloc] initWithFrame:CGRectMake(10, 80, pw - swatchSz - 28, 20)];
+    satSlider.minimumValue          = 0;
+    satSlider.maximumValue          = 255;
+    satSlider.value                 = _colorSat;
+    satSlider.minimumTrackTintColor = [UIColor colorWithRed:0.2 green:0.5 blue:1.0 alpha:1.0];
+    satSlider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.12];
+    satSlider.thumbTintColor        = [UIColor whiteColor];
+    [satSlider addTarget:self action:@selector(itemSatChanged:)
+        forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:satSlider];
+
+    // ── Divider ───────────────────────────────────────────────────────────────
+    UIView *div1 = [[UIView alloc] initWithFrame:CGRectMake(8, 104, pw - 16, 1)];
+    div1.backgroundColor = EL_DIVIDER;
+    [panel addSubview:div1];
+
+    // ── Row 3: Size ───────────────────────────────────────────────────────────
+    UILabel *sizeLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 108, 36, 14)];
+    sizeLbl.text      = @"📐 Size";
+    sizeLbl.font      = [UIFont boldSystemFontOfSize:10];
+    sizeLbl.textColor = EL_TEXT;
+    [panel addSubview:sizeLbl];
+
+    _itemScaleValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(56, 108, pw - 66, 14)];
+    _itemScaleValueLabel.text          = @"0 — normal";
+    _itemScaleValueLabel.font          = [UIFont boldSystemFontOfSize:10];
+    _itemScaleValueLabel.textColor     = EL_PINK;
+    _itemScaleValueLabel.textAlignment = NSTextAlignmentRight;
+    [panel addSubview:_itemScaleValueLabel];
+
+    UISlider *sizeSlider = [[UISlider alloc] initWithFrame:CGRectMake(10, 124, pw - 20, 20)];
+    sizeSlider.minimumValue          = -100;
+    sizeSlider.maximumValue          = 200;
+    sizeSlider.value                 = 0;
+    sizeSlider.minimumTrackTintColor = EL_BLUE;
+    sizeSlider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.12];
+    sizeSlider.thumbTintColor        = [UIColor whiteColor];
+    [sizeSlider addTarget:self action:@selector(itemScaleChanged:)
+        forControlEvents:UIControlEventValueChanged];
+    [panel addSubview:sizeSlider];
+
+    // ── Divider ───────────────────────────────────────────────────────────────
+    UIView *div2 = [[UIView alloc] initWithFrame:CGRectMake(8, 148, pw - 16, 1)];
+    div2.backgroundColor = EL_DIVIDER;
+    [panel addSubview:div2];
+
+    // ── Row 4: Qty + Slot ─────────────────────────────────────────────────────
+    UILabel *ql = [[UILabel alloc] initWithFrame:CGRectMake(10, 154, 28, 20)];
     ql.text      = @"Qty:";
-    ql.font      = [UIFont boldSystemFontOfSize:11];
+    ql.font      = [UIFont boldSystemFontOfSize:10];
     ql.textColor = EL_TEXT_DIM;
-    [_itemsPage addSubview:ql];
+    [panel addSubview:ql];
 
-    _qtyLabel = [[UILabel alloc] initWithFrame:CGRectMake(44, by, 36, 28)];
+    _qtyLabel = [[UILabel alloc] initWithFrame:CGRectMake(40, 154, 28, 20)];
     _qtyLabel.text          = @"1";
-    _qtyLabel.font          = [UIFont boldSystemFontOfSize:15];
+    _qtyLabel.font          = [UIFont boldSystemFontOfSize:13];
     _qtyLabel.textColor     = EL_PINK;
     _qtyLabel.textAlignment = NSTextAlignmentCenter;
-    [_itemsPage addSubview:_qtyLabel];
+    [panel addSubview:_qtyLabel];
 
-    [_itemsPage addSubview:[self makeStepBtn:@"−" frame:CGRectMake(82, by + 2, 28, 24)
-                                      action:@selector(qtyMinus)]];
-    [_itemsPage addSubview:[self makeStepBtn:@"+" frame:CGRectMake(112, by + 2, 28, 24)
-                                      action:@selector(qtyPlus)]];
+    [panel addSubview:[self makeStepBtn:@"−" frame:CGRectMake(70, 156, 22, 18) action:@selector(qtyMinus)]];
+    [panel addSubview:[self makeStepBtn:@"+" frame:CGRectMake(94, 156, 22, 18) action:@selector(qtyPlus)]];
 
-    // Slot cycler
-    UILabel *sl = [[UILabel alloc] initWithFrame:CGRectMake(w / 2, by, 36, 28)];
+    UILabel *sl = [[UILabel alloc] initWithFrame:CGRectMake(pw / 2 - 8, 154, 32, 20)];
     sl.text      = @"Slot:";
-    sl.font      = [UIFont boldSystemFontOfSize:11];
+    sl.font      = [UIFont boldSystemFontOfSize:10];
     sl.textColor = EL_TEXT_DIM;
-    [_itemsPage addSubview:sl];
+    [panel addSubview:sl];
 
-    _slotLabel = [[UILabel alloc] initWithFrame:CGRectMake(w / 2 + 38, by, 90, 28)];
+    _slotLabel = [[UILabel alloc] initWithFrame:CGRectMake(pw / 2 + 26, 154, 74, 20)];
     _slotLabel.text      = @"leftHand";
     _slotLabel.font      = [UIFont boldSystemFontOfSize:10];
     _slotLabel.textColor = EL_PURPLE;
-    [_itemsPage addSubview:_slotLabel];
+    [panel addSubview:_slotLabel];
 
-    UIButton *slotBtn = [[UIButton alloc] initWithFrame:CGRectMake(w - 46, by, 36, 28)];
-    slotBtn.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
-    slotBtn.layer.cornerRadius = 7;
+    UIButton *slotBtn = [[UIButton alloc] initWithFrame:CGRectMake(pw - 32, 154, 24, 20)];
+    slotBtn.backgroundColor    = [UIColor colorWithWhite:0 alpha:0.35];
+    slotBtn.layer.cornerRadius = 5;
     slotBtn.layer.borderWidth  = 1;
     slotBtn.layer.borderColor  = EL_BORDER;
     [slotBtn setTitle:@"⇄" forState:UIControlStateNormal];
     [slotBtn setTitleColor:EL_PURPLE forState:UIControlStateNormal];
-    slotBtn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    slotBtn.titleLabel.font = [UIFont boldSystemFontOfSize:11];
     UITapGestureRecognizer *st = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [st addTarget:^(__unused id s) { [self cycleSlot]; } withObject:nil];
+    [st el_addBlock:^(__unused id s) { [self cycleSlot]; }];
     [slotBtn addGestureRecognizer:st];
-    [_itemsPage addSubview:slotBtn];
+    [panel addSubview:slotBtn];
 
-    UIView *d2 = [[UIView alloc] initWithFrame:CGRectMake(10, by + 32, w - 20, 1)];
-    d2.backgroundColor = EL_DIVIDER;
-    [_itemsPage addSubview:d2];
-
-    // Spawn button (gradient)
+    // ── Spawn + Clear buttons ─────────────────────────────────────────────────
+    CGFloat by = panelY + panelH + 6;
     CGFloat spawnW = w - 20 - 56;
-    UIButton *spawn = [[UIButton alloc] initWithFrame:CGRectMake(10, by + 38, spawnW, 38)];
+    UIButton *spawn = [[UIButton alloc] initWithFrame:CGRectMake(10, by, spawnW, 38)];
     spawn.layer.cornerRadius = 10;
     spawn.clipsToBounds = YES;
     CAGradientLayer *spawnGrad = [CAGradientLayer layer];
@@ -679,12 +1688,11 @@ static void ELToast(NSString *msg, BOOL success) {
     spawn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
     ELGlow(spawn.layer, EL_PURPLE, 14);
     UITapGestureRecognizer *spawnT = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [spawnT addTarget:^(__unused id s) { [self doSpawn]; } withObject:nil];
+    [spawnT el_addBlock:^(__unused id s) { [self doSpawn]; }];
     [spawn addGestureRecognizer:spawnT];
     [_itemsPage addSubview:spawn];
 
-    // Clear button
-    UIButton *clear = [[UIButton alloc] initWithFrame:CGRectMake(w - 52, by + 38, 42, 38)];
+    UIButton *clear = [[UIButton alloc] initWithFrame:CGRectMake(w - 52, by, 42, 38)];
     clear.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
     clear.layer.cornerRadius = 10;
     clear.layer.borderWidth  = 1;
@@ -692,7 +1700,7 @@ static void ELToast(NSString *msg, BOOL success) {
     [clear setTitle:@"🗑" forState:UIControlStateNormal];
     clear.titleLabel.font = [UIFont systemFontOfSize:16];
     UITapGestureRecognizer *clearT = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
-    [clearT addTarget:^(__unused id s) { [self doClear]; } withObject:nil];
+    [clearT el_addBlock:^(__unused id s) { [self doClear]; }];
     [clear addGestureRecognizer:clearT];
     [_itemsPage addSubview:clear];
 }
@@ -725,16 +1733,186 @@ static void ELToast(NSString *msg, BOOL success) {
     hdr2.textColor = EL_TEXT_DIM;
     [_settingsPage addSubview:hdr2];
 
-    [self addToggleRow:@"Spin Items" subtitle:@"Items rotate in hand"  y:200 action:@selector(toggleSpin:)];
-    [self addToggleRow:@"God Mode"   subtitle:@"Infinite health"       y:250 action:@selector(toggleGod:)];
-    [self addToggleRow:@"No Clip"    subtitle:@"Walk through walls"    y:300 action:@selector(toggleClip:)];
+    [self addToggleRow:@"∞ Inf Ammo"         subtitle:@"Guns never run out of bullets"        y:200 action:@selector(toggleInfAmmo:)];
+    [self addToggleRow:@"❄️ Freeze Monsters" subtitle:@"Stops all AI + movement in real time" y:250 action:@selector(toggleFreeze:)];
+    [self addToggleRow:@"🚀 Fling"           subtitle:@"Tap screen to fling via RPC_Teleport" y:300 action:@selector(toggleFling:)];
 
-    UILabel *pathLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 356, w - 24, 30)];
+    UIView *d3 = [[UIView alloc] initWithFrame:CGRectMake(10, 350, w - 20, 1)];
+    d3.backgroundColor = EL_DIVIDER;
+    [_settingsPage addSubview:d3];
+
+    UILabel *hdr3 = [[UILabel alloc] initWithFrame:CGRectMake(12, 357, w, 16)];
+    hdr3.text      = @"✦ CURRENCY";
+    hdr3.font      = [UIFont boldSystemFontOfSize:10];
+    hdr3.textColor = EL_TEXT_DIM;
+    [_settingsPage addSubview:hdr3];
+
+    // Info label
+    UILabel *infoLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 376, w - 24, 28)];
+    infoLbl.text          = @"Sets Nuts to 999,999,999";
+    infoLbl.font          = [UIFont systemFontOfSize:10];
+    infoLbl.textColor     = EL_TEXT_DIM;
+    infoLbl.numberOfLines = 2;
+    [_settingsPage addSubview:infoLbl];
+
+    // Max Nuts button
+    CGFloat bw = w - 20;
+    UIButton *moneyBtn = [[UIButton alloc] initWithFrame:CGRectMake(10, 406, bw, 42)];
+    moneyBtn.layer.cornerRadius = 10;
+    moneyBtn.clipsToBounds = YES;
+    CAGradientLayer *mg = [CAGradientLayer layer];
+    mg.frame  = CGRectMake(0, 0, bw, 42);
+    mg.colors = @[
+        (id)[UIColor colorWithRed:0.8 green:0.6 blue:0.0 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.5 green:0.3 blue:0.0 alpha:1.0].CGColor,
+    ];
+    mg.startPoint = CGPointMake(0, 0.5);
+    mg.endPoint   = CGPointMake(1, 0.5);
+    [moneyBtn.layer insertSublayer:mg atIndex:0];
+    [moneyBtn setTitle:@"💰  MAX NUTS  (999,999,999)" forState:UIControlStateNormal];
+    [moneyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    moneyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    ELGlow(moneyBtn.layer, [UIColor colorWithRed:1.0 green:0.8 blue:0.0 alpha:1.0], 14);
+    UITapGestureRecognizer *mt = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+    [mt el_addBlock:^(__unused id s) {
+        BOOL ok = ELWriteMoney(999999999LL);
+        if (ok) ELToast(@"💰 Max currency written! Restart the game.", YES);
+        else    ELToast(@"Failed to write currency", NO);
+    }];
+    [moneyBtn addGestureRecognizer:mt];
+    [_settingsPage addSubview:moneyBtn];
+
+    UILabel *pathLbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 456, w - 24, 30)];
     pathLbl.text          = [NSString stringWithFormat:@"✦ %@", ELConfigPath()];
     pathLbl.font          = [UIFont fontWithName:@"Menlo" size:8] ?: [UIFont systemFontOfSize:8];
     pathLbl.textColor     = EL_TEXT_DIM;
     pathLbl.numberOfLines = 2;
     [_settingsPage addSubview:pathLbl];
+
+    // ── Body Scale ────────────────────────────────────────────────────────────
+    UIView *d4 = [[UIView alloc] initWithFrame:CGRectMake(10, 490, w - 20, 1)];
+    d4.backgroundColor = EL_DIVIDER;
+    [_settingsPage addSubview:d4];
+
+    UILabel *hdr4 = [[UILabel alloc] initWithFrame:CGRectMake(12, 497, w, 16)];
+    hdr4.text      = @"✦ BODY SIZE";
+    hdr4.font      = [UIFont boldSystemFontOfSize:10];
+    hdr4.textColor = EL_TEXT_DIM;
+    [_settingsPage addSubview:hdr4];
+
+    // Preset buttons: Tiny / Normal / Big / Giant
+    NSArray *sizePresets  = @[@"🐭 Tiny", @"🧍 Normal", @"🏀 Big", @"🏔 Giant"];
+    NSArray *sizeValues   = @[@0.3, @1.0, @2.5, @6.0];
+    CGFloat pbw = (w - 20 - 9) / 4.0f;
+    for (NSInteger i = 0; i < 4; i++) {
+        UIButton *pb = [[UIButton alloc] initWithFrame:CGRectMake(10 + i * (pbw + 3), 516, pbw, 34)];
+        pb.backgroundColor    = [UIColor colorWithWhite:0 alpha:0.4];
+        pb.layer.cornerRadius = 8;
+        pb.layer.borderWidth  = 1;
+        pb.layer.borderColor  = EL_BORDER;
+        [pb setTitle:sizePresets[(NSUInteger)i] forState:UIControlStateNormal];
+        [pb setTitleColor:EL_TEXT forState:UIControlStateNormal];
+        pb.titleLabel.font    = [UIFont boldSystemFontOfSize:10];
+        pb.titleLabel.adjustsFontSizeToFitWidth = YES;
+        CGFloat sv = [sizeValues[(NSUInteger)i] floatValue];
+        UITapGestureRecognizer *pt = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+        [pt el_addBlock:^(__unused id s) {
+            BOOL ok = ELWritePlayerScale(sv);
+            if (ok) ELToast([NSString stringWithFormat:@"Body scale → %.1fx", sv], YES);
+            else    ELToast(@"Failed to write scale", NO);
+        }];
+        [pb addGestureRecognizer:pt];
+        [_settingsPage addSubview:pb];
+    }
+
+    // Fine-grained scale slider
+    UILabel *scaleCurLbl = [[UILabel alloc] initWithFrame:CGRectMake(w - 54, 554, 44, 14)];
+    scaleCurLbl.text          = @"1.0x";
+    scaleCurLbl.font          = [UIFont boldSystemFontOfSize:10];
+    scaleCurLbl.textColor     = EL_PINK;
+    scaleCurLbl.textAlignment = NSTextAlignmentRight;
+    [_settingsPage addSubview:scaleCurLbl];
+
+    UILabel *scaleLblLeft = [[UILabel alloc] initWithFrame:CGRectMake(10, 554, 50, 14)];
+    scaleLblLeft.text      = @"Custom:";
+    scaleLblLeft.font      = [UIFont boldSystemFontOfSize:10];
+    scaleLblLeft.textColor = EL_TEXT_DIM;
+    [_settingsPage addSubview:scaleLblLeft];
+
+    UISlider *scaleSlider = [[UISlider alloc] initWithFrame:CGRectMake(62, 552, w - 120, 20)];
+    scaleSlider.minimumValue          = 0.1f;
+    scaleSlider.maximumValue          = 8.0f;
+    scaleSlider.value                 = 1.0f;
+    scaleSlider.minimumTrackTintColor = EL_PURPLE;
+    scaleSlider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.1];
+    scaleSlider.thumbTintColor        = [UIColor whiteColor];
+    // Store label ref via associated object so the handler can update it
+    objc_setAssociatedObject(scaleSlider, "lbl", scaleCurLbl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [scaleSlider addTarget:self action:@selector(bodyScaleChanged:)
+         forControlEvents:UIControlEventValueChanged];
+    [_settingsPage addSubview:scaleSlider];
+
+    // ── Power Items ───────────────────────────────────────────────────────────
+    UIView *d5 = [[UIView alloc] initWithFrame:CGRectMake(10, 580, w - 20, 1)];
+    d5.backgroundColor = EL_DIVIDER;
+    [_settingsPage addSubview:d5];
+
+    UILabel *hdr5 = [[UILabel alloc] initWithFrame:CGRectMake(12, 587, w, 16)];
+    hdr5.text      = @"✦ POWER ITEMS  (spawns in left hand)";
+    hdr5.font      = [UIFont boldSystemFontOfSize:10];
+    hdr5.textColor = EL_TEXT_DIM;
+    [_settingsPage addSubview:hdr5];
+
+    // Grid of one-tap power item buttons
+    NSArray *powerItems  = @[
+        @[@"❤️ Heart Choc",     @"item_heartchocolatebox"],
+        @[@"🥦 Rad Broccoli",   @"item_radioactive_broccoli"],
+        @[@"🥦 Shrink Brocco",  @"item_shrinking_broccoli"],
+        @[@"🧃 Heal Ration",    @"item_company_ration_heal"],
+        @[@"🩹 Ration",         @"item_company_ration"],
+        @[@"🍖 Turkey Leg",     @"item_turkey_leg"],
+        @[@"💊 Stash Grenade",  @"item_stash_grenade"],
+        @[@"🔦 Flashlight",     @"item_flashlight"],
+        @[@"🚀 Jetpack",        @"item_jetpack"],
+        @[@"🏓 Pogostick",      @"item_pogostick"],
+        @[@"🪝 Hookshot",       @"item_hookshot"],
+        @[@"📡 Teleporter",     @"item_portable_teleporter"],
+    ];
+    NSInteger cols   = 2;
+    CGFloat   piW    = (w - 20 - 6) / cols;
+    CGFloat   piH    = 32;
+    CGFloat   piTopY = 606;
+    for (NSInteger i = 0; i < (NSInteger)powerItems.count; i++) {
+        NSArray  *pair  = powerItems[(NSUInteger)i];
+        NSString *label = pair[0];
+        NSString *iid   = pair[1];
+        NSInteger col   = i % cols;
+        NSInteger row   = i / cols;
+        CGFloat   px    = 10 + col * (piW + 6);
+        CGFloat   py    = piTopY + row * (piH + 4);
+        UIButton *pib   = [[UIButton alloc] initWithFrame:CGRectMake(px, py, piW, piH)];
+        pib.backgroundColor    = [UIColor colorWithWhite:0 alpha:0.4];
+        pib.layer.cornerRadius = 8;
+        pib.layer.borderWidth  = 1;
+        pib.layer.borderColor  = EL_BORDER;
+        [pib setTitle:label forState:UIControlStateNormal];
+        [pib setTitleColor:EL_TEXT forState:UIControlStateNormal];
+        pib.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        pib.titleLabel.adjustsFontSizeToFitWidth = YES;
+        UITapGestureRecognizer *pit = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+        [pit el_addBlock:^(__unused id s) {
+            BOOL ok = ELWriteConfig(@"leftHand", iid, 159, 120, 0, 1, nil);
+            if (ok) ELToast([NSString stringWithFormat:@"✦ %@ spawned", label], YES);
+            else    ELToast(@"Failed to spawn item", NO);
+        }];
+        [pib addGestureRecognizer:pit];
+        [_settingsPage addSubview:pib];
+    }
+
+    // Bottom padding label
+    NSInteger powerRows = (powerItems.count + cols - 1) / cols;
+    CGFloat   bottomY   = piTopY + powerRows * (piH + 4) + 10;
+    _settingsPage.contentSize = CGSizeMake(w, bottomY);
 }
 
 // ─── Slider row helper ────────────────────────────────────────────────────────
@@ -809,16 +1987,18 @@ static void ELToast(NSString *msg, BOOL success) {
                  [NSPredicate predicateWithFormat:@"SELF CONTAINS[cd] %@", q]];
 
     CGFloat   rh      = 36;
+    // Use frame width — bounds.size.width is 0 until after the first layout pass
+    CGFloat   listW   = _itemList.frame.size.width;
     NSInteger iCount  = (NSInteger)items.count;   // FIX 3
     for (NSInteger i = 0; i < iCount; i++) {
         NSString *name = items[(NSUInteger)i];
         UIView *row = [[UIView alloc] initWithFrame:
-                       CGRectMake(0, i * rh, _itemList.bounds.size.width, rh)];
+                       CGRectMake(0, i * rh, listW, rh)];
         row.backgroundColor = (i % 2 == 0) ? [UIColor clearColor]
                                             : [UIColor colorWithWhite:1 alpha:0.02];
 
         UILabel *lbl = [[UILabel alloc] initWithFrame:
-                        CGRectMake(10, 0, _itemList.bounds.size.width - 20, rh)];
+                        CGRectMake(10, 0, listW - 20, rh)];
         lbl.text                     = name;
         lbl.font                     = [UIFont fontWithName:@"Menlo" size:11]
                                     ?: [UIFont systemFontOfSize:11];
@@ -833,12 +2013,12 @@ static void ELToast(NSString *msg, BOOL success) {
 
         UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
         NSString *cn = name;
-        [t addTarget:^(__unused id s) { [self selectItemNamed:cn row:nil]; } withObject:nil];
+        [t el_addBlock:^(__unused id s) { [self selectItemNamed:cn row:nil]; }];
         [row addGestureRecognizer:t];
         [_itemList addSubview:row];
         [_rowViews addObject:row];
     }
-    _itemList.contentSize = CGSizeMake(_itemList.bounds.size.width, items.count * rh);
+    _itemList.contentSize = CGSizeMake(_itemList.frame.size.width, items.count * rh);
     _countLabel.text = [NSString stringWithFormat:@"%lu items", (unsigned long)items.count];
 }
 
@@ -886,16 +2066,53 @@ static void ELToast(NSString *msg, BOOL success) {
 - (void)satChanged:(UISlider *)s   { _colorSat = (NSInteger)s.value; _satLabel.text   = @(_colorSat).stringValue; }
 - (void)scaleChanged:(UISlider *)s { _scaleVal  = (NSInteger)s.value; _scaleLabel.text = @(_scaleVal).stringValue; }
 
-- (void)toggleSpin:(UISwitch *)s  { NSLog(@"[EverLight] Spin: %d",   s.on); }
-- (void)toggleGod:(UISwitch *)s   { NSLog(@"[EverLight] God: %d",    s.on); }
-- (void)toggleClip:(UISwitch *)s  { NSLog(@"[EverLight] NoClip: %d", s.on); }
+- (void)bodyScaleChanged:(UISlider *)s {
+    CGFloat scale = s.value;
+    UILabel *lbl = objc_getAssociatedObject(s, "lbl");
+    lbl.text = [NSString stringWithFormat:@"%.2fx", scale];
+    ELWritePlayerScale(scale);
+}
+
+// ── Inline Items-page slider handlers ────────────────────────────────────────
+- (void)itemHueChanged:(UISlider *)s {
+    _colorHue = (NSInteger)s.value;
+    _itemHueValueLabel.text = [NSString stringWithFormat:@"%ld°", (long)_colorHue];
+    _itemColorSwatch.backgroundColor = [UIColor colorWithHue:_colorHue / 360.0f
+                                                  saturation:_colorSat / 255.0f
+                                                  brightness:1.0f alpha:1.0f];
+    if (_hueLabel) _hueLabel.text = @(_colorHue).stringValue;
+}
+
+- (void)itemSatChanged:(UISlider *)s {
+    _colorSat = (NSInteger)s.value;
+    _itemSatValueLabel.text = [NSString stringWithFormat:@"%ld", (long)_colorSat];
+    _itemColorSwatch.backgroundColor = [UIColor colorWithHue:_colorHue / 360.0f
+                                                  saturation:_colorSat / 255.0f
+                                                  brightness:1.0f alpha:1.0f];
+    if (_satLabel) _satLabel.text = @(_colorSat).stringValue;
+}
+
+- (void)itemScaleChanged:(UISlider *)s {
+    _scaleVal = (NSInteger)s.value;
+    NSString *tag = (_scaleVal == 0) ? @"normal" : (_scaleVal > 0 ? @"bigger" : @"smaller");
+    _itemScaleValueLabel.text = [NSString stringWithFormat:@"%ld (%@)", (long)_scaleVal, tag];
+    if (_scaleLabel) _scaleLabel.text = @(_scaleVal).stringValue;
+}
+
+- (void)toggleFreeze:(UISwitch *)s   { ELToggleFreeze(s.on); }
+- (void)toggleFling:(UISwitch *)s    { ELToggleFling(s.on); }
+- (void)toggleInfAmmo:(UISwitch *)s {
+    ELToggleInfAmmo(s.on);
+    if (s.on) ELToast(@"∞ Infinite Ammo ON — hooks live + config written", YES);
+    else      ELToast(@"∞ Infinite Ammo OFF", NO);
+}
 
 - (void)doSpawn {
     if (!_selectedItem) { ELToast(@"Select an item first", NO); return; }
     NSMutableArray *children = nil;
     if (_quantity > 1) {
         children = [NSMutableArray array];
-        for (NSInteger i = 1; i < _quantity; i++)
+        for (NSInteger i = 0; i < _quantity - 1; i++)
             [children addObject:ELMakeItemNode(_selectedItem, _colorHue, _colorSat, 0, 1, nil)];
     }
     BOOL ok = ELWriteConfig(_selectedSlot, _selectedItem, _colorHue, _colorSat,
@@ -929,6 +2146,15 @@ static void ELToast(NSString *msg, BOOL success) {
     [pan setTranslation:CGPointZero inView:self.superview];
 }
 
+- (void)rotateMenu {
+    _menuRotation += M_PI_2;  // 90 degrees clockwise
+    [UIView animateWithDuration:0.35 delay:0
+         usingSpringWithDamping:0.75 initialSpringVelocity:0.5 options:0
+                     animations:^{
+        self.transform = CGAffineTransformMakeRotation(_menuRotation);
+    } completion:nil];
+}
+
 - (UIButton *)makeStepBtn:(NSString *)t frame:(CGRect)r action:(SEL)a {
     UIButton *b = [[UIButton alloc] initWithFrame:r];
     b.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
@@ -940,6 +2166,328 @@ static void ELToast(NSString *msg, BOOL success) {
     b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
     [b addTarget:self action:a forControlEvents:UIControlEventTouchUpInside];
     return b;
+}
+
+
+// ─── Monsters Page ────────────────────────────────────────────────────────────
+- (void)buildMonstersPage {
+    CGFloat w = _monstersPage.bounds.size.width;
+    CGFloat h = _monstersPage.bounds.size.height;
+
+    // ── Category filter pills ─────────────────────────────────────────────────
+    NSArray *cats = @[@"All", @"Humanoid", @"Creature", @"Ambient", @"Explosive"];
+    UIScrollView *catScroll = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 6, w - 16, 34)];
+    catScroll.showsHorizontalScrollIndicator = NO;
+    [_monstersPage addSubview:catScroll];
+    CGFloat cx = 4;
+    for (NSInteger i = 0; i < (NSInteger)cats.count; i++) {
+        NSString *label = cats[(NSUInteger)i];
+        CGFloat pw = [label sizeWithAttributes:@{NSFontAttributeName:[UIFont boldSystemFontOfSize:10]}].width + 18;
+        UIButton *pill = [[UIButton alloc] initWithFrame:CGRectMake(cx, 3, pw, 26)];
+        pill.layer.cornerRadius = 13;
+        pill.layer.borderWidth  = 1;
+        pill.tag = 9000 + i;
+        BOOL active = (i == _monsterCatIndex);
+        pill.backgroundColor  = active ? EL_PURPLE_DIM : [UIColor colorWithWhite:1 alpha:0.05];
+        pill.layer.borderColor = active ? EL_BORDER : [UIColor colorWithWhite:1 alpha:0.1].CGColor;
+        [pill setTitle:label forState:UIControlStateNormal];
+        [pill setTitleColor:active ? EL_PURPLE : EL_TEXT_DIM forState:UIControlStateNormal];
+        pill.titleLabel.font = [UIFont boldSystemFontOfSize:10];
+        NSInteger ci = i;
+        UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+        [t el_addBlock:^(__unused id s) { [self selectMonsterCategory:ci scroll:catScroll]; }];
+        [pill addGestureRecognizer:t];
+        [catScroll addSubview:pill];
+        cx += pw + 5;
+    }
+    catScroll.contentSize = CGSizeMake(cx + 4, 34);
+
+    // ── Search bar ────────────────────────────────────────────────────────────
+    UIView *searchWrap = [[UIView alloc] initWithFrame:CGRectMake(8, 44, w - 16, 30)];
+    searchWrap.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
+    searchWrap.layer.cornerRadius = 8;
+    searchWrap.layer.borderWidth  = 1;
+    searchWrap.layer.borderColor  = EL_BORDER;
+    [_monstersPage addSubview:searchWrap];
+
+    UILabel *searchIcon = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, 20, 30)];
+    searchIcon.text      = @"✦";
+    searchIcon.font      = [UIFont systemFontOfSize:10];
+    searchIcon.textColor = EL_TEXT_DIM;
+    [searchWrap addSubview:searchIcon];
+
+    _monsterSearchField = [[UITextField alloc] initWithFrame:CGRectMake(26, 0, w - 52, 30)];
+    _monsterSearchField.font            = [UIFont systemFontOfSize:11];
+    _monsterSearchField.textColor       = EL_TEXT;
+    _monsterSearchField.returnKeyType   = UIReturnKeyDone;
+    _monsterSearchField.delegate        = self;
+    _monsterSearchField.backgroundColor = [UIColor clearColor];
+    _monsterSearchField.attributedPlaceholder = [[NSAttributedString alloc]
+        initWithString:@"Search monsters..."
+            attributes:@{NSForegroundColorAttributeName: EL_TEXT_DIM,
+                         NSFontAttributeName: [UIFont systemFontOfSize:11]}];
+    [_monsterSearchField addTarget:self action:@selector(monsterSearchChanged)
+                  forControlEvents:UIControlEventEditingChanged];
+    [searchWrap addSubview:_monsterSearchField];
+
+    // ── Header labels ─────────────────────────────────────────────────────────
+    UILabel *mHdr = [[UILabel alloc] initWithFrame:CGRectMake(12, 78, 160, 16)];
+    mHdr.text      = @"✦ MONSTER SPAWNER";
+    mHdr.font      = [UIFont boldSystemFontOfSize:10];
+    mHdr.textColor = EL_TEXT_DIM;
+    [_monstersPage addSubview:mHdr];
+
+    // ── Selected monster display ──────────────────────────────────────────────
+    UIView *selWrap = [[UIView alloc] initWithFrame:CGRectMake(8, 96, w - 16, 26)];
+    selWrap.backgroundColor  = EL_PURPLE_DIM;
+    selWrap.layer.cornerRadius = 6;
+    selWrap.layer.borderWidth  = 1;
+    selWrap.layer.borderColor  = EL_BORDER;
+    [_monstersPage addSubview:selWrap];
+
+    _selectedMonsterLabel = [[UILabel alloc] initWithFrame:CGRectMake(8, 0, w - 40, 26)];
+    _selectedMonsterLabel.text      = @"tap a monster to select...";
+    _selectedMonsterLabel.font      = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+    _selectedMonsterLabel.textColor = EL_TEXT_DIM;
+    [selWrap addSubview:_selectedMonsterLabel];
+
+    // ── Monster list ──────────────────────────────────────────────────────────
+    CGFloat listH = h - 300;
+    _monsterList = [[UIScrollView alloc] initWithFrame:CGRectMake(8, 126, w - 16, listH)];
+    _monsterList.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.35];
+    _monsterList.layer.cornerRadius = 10;
+    _monsterList.layer.borderWidth  = 1;
+    _monsterList.layer.borderColor  = EL_BORDER;
+    [_monstersPage addSubview:_monsterList];
+    [self reloadMonsterList];
+
+    // ── Controls row ──────────────────────────────────────────────────────────
+    CGFloat cy = 126 + listH + 8;
+
+    // Qty
+    UILabel *ql = [[UILabel alloc] initWithFrame:CGRectMake(10, cy + 4, 30, 20)];
+    ql.text = @"Qty:"; ql.font = [UIFont boldSystemFontOfSize:10]; ql.textColor = EL_TEXT_DIM;
+    [_monstersPage addSubview:ql];
+
+    _monsterQtyLabel = [[UILabel alloc] initWithFrame:CGRectMake(42, cy + 2, 26, 24)];
+    _monsterQtyLabel.text = @"1"; _monsterQtyLabel.textAlignment = NSTextAlignmentCenter;
+    _monsterQtyLabel.font = [UIFont boldSystemFontOfSize:14]; _monsterQtyLabel.textColor = EL_PINK;
+    [_monstersPage addSubview:_monsterQtyLabel];
+    [_monstersPage addSubview:[self makeStepBtn:@"−" frame:CGRectMake(70, cy+2, 24, 22) action:@selector(monsterQtyMinus)]];
+    [_monstersPage addSubview:[self makeStepBtn:@"+" frame:CGRectMake(96, cy+2, 24, 22) action:@selector(monsterQtyPlus)]];
+
+    // Size slider label
+    UILabel *szLabel = [[UILabel alloc] initWithFrame:CGRectMake(130, cy + 4, 28, 16)];
+    szLabel.text = @"Size:"; szLabel.font = [UIFont boldSystemFontOfSize:9]; szLabel.textColor = EL_TEXT_DIM;
+    [_monstersPage addSubview:szLabel];
+
+    _monsterScaleLabel = [[UILabel alloc] initWithFrame:CGRectMake(w - 46, cy + 4, 38, 16)];
+    _monsterScaleLabel.text = @"1.0x"; _monsterScaleLabel.font = [UIFont boldSystemFontOfSize:9];
+    _monsterScaleLabel.textColor = EL_PINK; _monsterScaleLabel.textAlignment = NSTextAlignmentRight;
+    [_monstersPage addSubview:_monsterScaleLabel];
+
+    UISlider *sizeSlider = [[UISlider alloc] initWithFrame:CGRectMake(160, cy + 6, w - 210, 18)];
+    sizeSlider.minimumValue = 0.1f; sizeSlider.maximumValue = 10.0f; sizeSlider.value = 1.0f;
+    sizeSlider.minimumTrackTintColor = EL_PURPLE;
+    sizeSlider.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.1];
+    sizeSlider.thumbTintColor = [UIColor whiteColor];
+    [sizeSlider addTarget:self action:@selector(monsterSizeChanged:) forControlEvents:UIControlEventValueChanged];
+    [_monstersPage addSubview:sizeSlider];
+
+    cy += 30;
+
+    // Color Hue slider
+    UILabel *hueLbl = [[UILabel alloc] initWithFrame:CGRectMake(10, cy + 4, 50, 16)];
+    hueLbl.text = @"Color:"; hueLbl.font = [UIFont boldSystemFontOfSize:9]; hueLbl.textColor = EL_TEXT_DIM;
+    [_monstersPage addSubview:hueLbl];
+
+    _monsterHueLabel = [[UILabel alloc] initWithFrame:CGRectMake(w - 46, cy + 4, 38, 16)];
+    _monsterHueLabel.text = @"0°"; _monsterHueLabel.font = [UIFont boldSystemFontOfSize:9];
+    _monsterHueLabel.textColor = EL_PINK; _monsterHueLabel.textAlignment = NSTextAlignmentRight;
+    [_monstersPage addSubview:_monsterHueLabel];
+
+    // Rainbow gradient track behind the slider
+    UIView *hueTrackBg = [[UIView alloc] initWithFrame:CGRectMake(60, cy + 8, w - 110, 8)];
+    hueTrackBg.layer.cornerRadius = 4;
+    hueTrackBg.clipsToBounds = YES;
+    CAGradientLayer *rainbow = [CAGradientLayer layer];
+    rainbow.frame = CGRectMake(0, 0, w - 110, 8);
+    rainbow.colors = @[
+        (id)[UIColor colorWithRed:1 green:0 blue:0 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:1 green:1 blue:0 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:0 green:1 blue:0 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:0 green:1 blue:1 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:0 green:0 blue:1 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:1 green:0 blue:1 alpha:1].CGColor,
+        (id)[UIColor colorWithRed:1 green:0 blue:0 alpha:1].CGColor,
+    ];
+    rainbow.startPoint = CGPointMake(0, 0.5); rainbow.endPoint = CGPointMake(1, 0.5);
+    [hueTrackBg.layer addSublayer:rainbow];
+    [_monstersPage addSubview:hueTrackBg];
+
+    UISlider *hueSlider = [[UISlider alloc] initWithFrame:CGRectMake(58, cy + 4, w - 106, 18)];
+    hueSlider.minimumValue = 0; hueSlider.maximumValue = 360; hueSlider.value = 0;
+    hueSlider.minimumTrackTintColor = [UIColor clearColor];
+    hueSlider.maximumTrackTintColor = [UIColor clearColor];
+    hueSlider.thumbTintColor = [UIColor whiteColor];
+    [hueSlider addTarget:self action:@selector(monsterHueChanged:) forControlEvents:UIControlEventValueChanged];
+    [_monstersPage addSubview:hueSlider];
+
+    cy += 30;
+
+    // Divider
+    UIView *d = [[UIView alloc] initWithFrame:CGRectMake(8, cy, w - 16, 1)];
+    d.backgroundColor = EL_DIVIDER;
+    [_monstersPage addSubview:d];
+    cy += 6;
+
+    // SPAWN button
+    CGFloat bw = w - 16 - 50;
+    UIButton *spawnBtn = [[UIButton alloc] initWithFrame:CGRectMake(8, cy, bw, 38)];
+    spawnBtn.layer.cornerRadius = 10; spawnBtn.clipsToBounds = YES;
+    CAGradientLayer *sg = [CAGradientLayer layer];
+    sg.frame = CGRectMake(0, 0, bw, 38);
+    sg.colors = @[
+        (id)[UIColor colorWithRed:0.8 green:0.1 blue:0.5 alpha:1.0].CGColor,
+        (id)[UIColor colorWithRed:0.4 green:0.1 blue:0.9 alpha:1.0].CGColor,
+    ];
+    sg.startPoint = CGPointMake(0, 0.5); sg.endPoint = CGPointMake(1, 0.5);
+    [spawnBtn.layer insertSublayer:sg atIndex:0];
+    [spawnBtn setTitle:@"✦  SPAWN MONSTER" forState:UIControlStateNormal];
+    [spawnBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    spawnBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    ELGlow(spawnBtn.layer, [UIColor colorWithRed:0.8 green:0.1 blue:0.5 alpha:1], 14);
+    UITapGestureRecognizer *spawnTap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+    [spawnTap el_addBlock:^(__unused id s) { [self doSpawnMonster]; }];
+    [spawnBtn addGestureRecognizer:spawnTap];
+    [_monstersPage addSubview:spawnBtn];
+
+    // Clear button
+    UIButton *clearBtn = [[UIButton alloc] initWithFrame:CGRectMake(w - 46, cy, 38, 38)];
+    clearBtn.backgroundColor  = [UIColor colorWithWhite:0 alpha:0.4];
+    clearBtn.layer.cornerRadius = 10;
+    clearBtn.layer.borderWidth  = 1; clearBtn.layer.borderColor = EL_BORDER;
+    [clearBtn setTitle:@"🗑" forState:UIControlStateNormal];
+    clearBtn.titleLabel.font = [UIFont systemFontOfSize:16];
+    UITapGestureRecognizer *clearTap = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+    [clearTap el_addBlock:^(__unused id s) { [self clearMonsters]; }];
+    [clearBtn addGestureRecognizer:clearTap];
+    [_monstersPage addSubview:clearBtn];
+}
+
+// ─── Monster list reload ───────────────────────────────────────────────────────
+- (void)reloadMonsterList {
+    for (UIView *r in _monsterRowViews) [r removeFromSuperview];
+    [_monsterRowViews removeAllObjects];
+
+    NSArray *monsters = _currentMonsters;
+    NSString *q = _monsterSearchField.text;
+    if (q.length > 0)
+        monsters = [monsters filteredArrayUsingPredicate:
+                    [NSPredicate predicateWithFormat:@"SELF CONTAINS[cd] %@", q]];
+
+    CGFloat rh    = 36;
+    CGFloat listW = _monsterList.frame.size.width;
+    NSInteger cnt = (NSInteger)monsters.count;
+    for (NSInteger i = 0; i < cnt; i++) {
+        NSString *mid  = monsters[(NSUInteger)i];
+        NSString *name = ELMonsterDisplayName(mid);
+        UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, i * rh, listW, rh)];
+        BOOL sel = [mid isEqualToString:_selectedMonster];
+        row.backgroundColor = sel ? EL_PURPLE_DIM : (i % 2 == 0 ?
+            [UIColor colorWithWhite:1 alpha:0.03] : [UIColor clearColor]);
+
+        UIView *accent = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 3, rh)];
+        accent.backgroundColor = sel ? EL_PURPLE : [UIColor clearColor];
+        [row addSubview:accent];
+
+        UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(10, 0, listW - 20, rh)];
+        lbl.text      = name;
+        lbl.font      = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+        lbl.textColor = sel ? EL_PURPLE : EL_TEXT;
+        [row addSubview:lbl];
+
+        UIView *sep = [[UIView alloc] initWithFrame:CGRectMake(0, rh - 1, listW, 1)];
+        sep.backgroundColor = EL_DIVIDER;
+        [row addSubview:sep];
+
+        NSString *cm = mid;
+        UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:nil action:nil];
+        [t el_addBlock:^(__unused id s) { [self selectMonsterNamed:cm]; }];
+        [row addGestureRecognizer:t];
+        [_monsterList addSubview:row];
+        [_monsterRowViews addObject:row];
+    }
+    _monsterList.contentSize = CGSizeMake(listW, cnt * rh);
+}
+
+- (void)selectMonsterNamed:(NSString *)mid {
+    _selectedMonster = mid;
+    _selectedMonsterLabel.text      = ELMonsterDisplayName(mid);
+    _selectedMonsterLabel.textColor = EL_PURPLE;
+    [self reloadMonsterList];
+}
+
+- (void)selectMonsterCategory:(NSInteger)cat scroll:(UIScrollView *)scroll {
+    _monsterCatIndex = cat;
+    _currentMonsters = ELMonsterCategory(cat);
+    // Update pill styles
+    for (UIView *sub in scroll.subviews) {
+        if (![sub isKindOfClass:[UIButton class]]) continue;
+        UIButton *b = (UIButton *)sub;
+        NSInteger bi = b.tag - 9000;
+        BOOL active = (bi == cat);
+        b.backgroundColor  = active ? EL_PURPLE_DIM : [UIColor colorWithWhite:1 alpha:0.05];
+        [b setTitleColor:active ? EL_PURPLE : EL_TEXT_DIM forState:UIControlStateNormal];
+        b.layer.borderColor = active ? EL_BORDER : [UIColor colorWithWhite:1 alpha:0.08].CGColor;
+    }
+    [self reloadMonsterList];
+}
+
+- (void)monsterSearchChanged { [self reloadMonsterList]; }
+
+- (void)monsterQtyMinus { if (_monsterQty > 1)  { _monsterQty--;  _monsterQtyLabel.text = @(_monsterQty).stringValue; } }
+- (void)monsterQtyPlus  { if (_monsterQty < 20) { _monsterQty++;  _monsterQtyLabel.text = @(_monsterQty).stringValue; } }
+
+- (void)monsterSizeChanged:(UISlider *)s {
+    _monsterScale = s.value;
+    _monsterScaleLabel.text = [NSString stringWithFormat:@"%.1fx", _monsterScale];
+}
+
+- (void)monsterHueChanged:(UISlider *)s {
+    _monsterColorHue = (NSInteger)s.value;
+    _monsterHueLabel.text = [NSString stringWithFormat:@"%ld°", (long)_monsterColorHue];
+}
+
+- (void)doSpawnMonster {
+    if (!_selectedMonster) { ELToast(@"Select a monster first", NO); return; }
+    BOOL ok = ELSpawnMonster(_selectedMonster, _monsterScale, _monsterColorHue, _monsterQty);
+    if (ok)
+        ELToast([NSString stringWithFormat:@"✦ Spawned %@ x%ld (%.1fx size)",
+                 ELMonsterDisplayName(_selectedMonster), (long)_monsterQty, _monsterScale], YES);
+    else
+        ELToast(@"Failed to write monster config", NO);
+}
+
+- (void)clearMonsters {
+    NSString *path = ELConfigPath();
+    NSMutableDictionary *config = [@{
+        @"leftHand": @{}, @"rightHand": @{}, @"leftHip": @{}, @"rightHip": @{}, @"back": @{}
+    } mutableCopy];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        NSData *d = [NSData dataWithContentsOfFile:path];
+        NSDictionary *p = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+        if (p) config = [p mutableCopy];
+    }
+    [config removeObjectForKey:@"monsters"];
+    [config removeObjectForKey:@"monsterSpawns"];
+    [config removeObjectForKey:@"enemySpawns"];
+    [config removeObjectForKey:@"spawnMonsters"];
+    [config removeObjectForKey:@"enemies"];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:config
+                                                  options:NSJSONWritingPrettyPrinted error:nil];
+    [data writeToFile:path atomically:YES];
+    ELToast(@"Monster spawns cleared", YES);
 }
 
 - (BOOL)textFieldShouldReturn:(UITextField *)tf {
@@ -957,10 +2505,15 @@ static EverLightMenu *gMenu = nil;
 static UIButton      *gBtn  = nil;
 
 static void ELInject(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        UIWindow *win = ELKeyWindow();   // FIX 4
-        if (!win) return;
+    // Run directly on main queue — caller (ELInit) already provided the delay.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = ELKeyWindow();
+        if (!win) {
+            // Window not ready yet — retry in 1 s
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ ELInject(); });
+            return;
+        }
 
         // Floating galaxy button
         gBtn = [[UIButton alloc] initWithFrame:
@@ -1006,7 +2559,7 @@ static void ELInject(void) {
         // Button tap — toggle menu
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
                                        initWithTarget:nil action:nil];
-        [tap addTarget:^(__unused id t) {
+        [tap el_addBlock:^(__unused id t) {
             if (gMenu.hidden) {
                 gMenu.hidden    = NO;
                 gMenu.alpha     = 0;
@@ -1020,15 +2573,16 @@ static void ELInject(void) {
             } else {
                 [gMenu dismiss];
             }
-        } withObject:nil];
+        }];
         [gBtn addGestureRecognizer:tap];
     });
 }
 
 __attribute__((constructor))
 static void ELInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        ELInject();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+        for (int i = 0; i < 100; i++) { usleep(200000); if ([UIApplication sharedApplication]) break; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ ELInject(); });
     });
 }
