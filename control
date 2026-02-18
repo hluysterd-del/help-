@@ -1,0 +1,9 @@
+Package: com.everlight.tweak
+Name: EverLight
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Galaxy-themed item spawner for Animal Company.
+Maintainer: everlight
+Author: everlight
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000)
